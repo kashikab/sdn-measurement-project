@@ -76,12 +76,9 @@ Throughput is received bytes x 8 divided by the time between the first and last 
 
 | ID | What is tested | How | Expected | Actual |
 |---|---|---|---|---|
-| A1 | Normal transfer, no loss | receiver, then sender at 200 pkt/s, 1000 B, 5 s | received = sent = 1000, loss 0% | |
-| A2 | Forced loss detection | receiver with `--drop-every 10`, same sender | about 10% loss (100 of 1000) | |
-| A3 | Throughput accuracy | A1 result | close to rate x size x 8 = 1.6 Mbit/s | |
-| A4 | Receiver not running | sender only | sender finishes, no error (UDP has no connection) | |
-| A5 | Invalid arguments | `--dst 999.1.1.1`, `--rate 0`, `--size 5000` | clear error message, exit code 1 | |
-| A6 | Malformed packet | send 2-byte packet to receiver | ignored, counted in `ignored_malformed`, no crash | |
-| A7 | End marker lost | send packets without a marker | receiver estimates total, `sent_source` is `estimated_from_max_seq` | |
-| A8 | Inside Mininet | h2 receiver, h1 sender | received equals sent, throughput close to offered rate | |
-| A9 | Two senders at once | h1 and h3 send to h2 together (on one machine: `--src 127.0.0.2` and `--src 127.0.0.3`) | separate entry and correct counts per sender in the results file | |
+| A1 | Normal transfer and throughput | receiver, then sender at 200 pkt/s, 1000 B, 5 s (loopback) | received = sent = 1000, loss 0%, throughput close to 200 x 1000 x 8 = 1.6 Mbit/s | 1000 sent, 1000 received, 0 lost (0.00%), 1.602 Mbit/s (screenshots: `results/A1_sender.png`, `results/A1_receiver.png`) |
+| A2 | Forced loss detection | receiver with `--drop-every 10`, same sender | about 10% loss (100 of 1000) | 1000 sent, 900 received, 100 lost (10.00%), 1.443 Mbit/s (screenshots: `results/A2_receiver.png`, `results/A2_sender.png`) |
+| A3 | Invalid arguments | `--dst 999.1.1.1`, `--rate 0`, `--size 5000` | clear error message each time, nothing is sent | Rejected each time: "'999.1.1.1' is not a valid IPv4 address"; "--rate must be greater than 0"; "--size must be between 12 and 1472 bytes" (screenshot: `results/A3_errors.png`) |
+| A4 | Two senders at once | `--src 127.0.0.2` and `--src 127.0.0.3` sending to one receiver together | separate entry and correct counts per sender | Two separate entries: 127.0.0.3 sent 1000, received 1000, 0% loss, 1.001 Mbit/s; 127.0.0.2 sent 400, received 400, 0% loss, 0.802 Mbit/s (screenshots: `results/A4_receiver.png`, `results/A4_senders.png`) |
+| A5 | Inside Mininet (no SDN controller) | `sudo mn --topo single,3` (Mininet fell back to a plain OVS bridge); h2 receiver, h1 sender at 100 pkt/s, 1000 B, 10 s | received equals sent, throughput close to 0.8 Mbit/s | pingall 0% dropped (6/6). 1000 sent, 1000 received, 0 lost (0.00%), 0.801 Mbit/s over 9.990 s (screenshot: `results/A5_mininet.png`) |
+| A6 | Inside Mininet with the team's SDN controller | topology and controller from the repo; h2 receiver, h1 sender | received equals sent; controller installs the UDP flow and reports its counters | |
