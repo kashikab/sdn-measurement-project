@@ -74,16 +74,14 @@ This project generates UDP traffic, measures it both ways, and compares the two 
 
 ### 2.3 Communication Flow
 
-1. The controller starts, and the Mininet topology connects the switch to it.
-2. The controller installs a default rule so the switch sends unknown traffic to the controller.
-3. The receiver on h2 starts and listens on UDP port 5001.
-4. The sender on h1 starts transmitting numbered UDP packets at the configured rate.
-5. When the switch connects, the controller installs two rules: a table-miss rule (unknown traffic goes to the controller, which learns MAC addresses so ping and ARP work) and a measurement rule that matches only UDP from 10.0.0.1 to 10.0.0.2 on port 5001 and forwards it to h2.
-6. The sender's packets match the measurement rule, so the switch forwards them directly and increments that rule's packet and byte counters.
-7. Other traffic (ping, ARP) does not match the measurement rule and is not counted.
-8. The sender reports packets and bytes transmitted. The receiver reports packets and bytes received, throughput and packet loss.
-9. The controller periodically requests flow statistics and records the counters for the measurement flow.
-10. The application results and the switch counters are then compared (manually in Deliverable 1, automatically in Deliverable 2).
+1. The Ryu controller starts and listens on port 6653.
+2. Mininet starts, s1 connects to the controller, and the controller installs two rules: a table-miss rule (send unknown traffic to the controller) and a measurement rule (UDP from 10.0.0.1 to 10.0.0.2 on port 5001, forward to h2, with counters).
+3. ARP and ping packets reach the controller through the table-miss rule. It learns MAC addresses and installs forwarding rules so the hosts can reach each other.
+4. The receiver on h2 starts and listens on UDP port 5001.
+5. The sender on h1 transmits numbered packets. They match the measurement rule, so the switch forwards them directly and increments the packet and byte counters. The controller is not involved per packet.
+6. The controller requests flow statistics every 2 seconds and records them in `flow_stats.csv`.
+7. The sender finishes with 5 end-marker packets. Both applications print their totals.
+8. The application results and the switch counters are compared (manually in Deliverable 1, automatically in Deliverable 2).
 
 ### 2.4 Packet Format
 
@@ -100,7 +98,7 @@ This project generates UDP traffic, measures it both ways, and compares the two 
 | Packets | Counted by sender and receiver | Switch flow-rule packet counter |
 | Bytes | Payload bytes counted by the application | Switch byte counter, which includes Ethernet, IP and UDP headers |
 | Throughput | Received bytes divided by time between first and last packet | Switch bytes divided by the measurement interval |
-| Packet loss | Packets sent minus packets received | Derived by comparing the switch packet count with the sender's count |
+| Packet loss | Packets sent minus packets received | Switch packet count minus 5 end markers, compared with the receiver's received count. This shows packets lost after the switch. |
 
 ---
 
@@ -123,7 +121,7 @@ flowchart LR
 ## 3. Expected Network Behaviour
 
 - Hosts can reach each other through the switch once the controller has installed forwarding rules.
-- The first packet of a new flow is handled by the controller. Subsequent packets are forwarded by the switch directly.
+- ARP and ping packets are handled by the controller, which learns MAC addresses and installs forwarding rules. The UDP measurement flow matches the pre-installed measurement rule from its very first datagram, so the switch forwards and counts it directly.
 - The packet count seen by the switch should equal the application's packet count plus 5, because the sender transmits 5 copies of the end marker that the application does not count as data (for example 1000 data packets give 1005 on the switch).
 - **The network byte count will be larger than the application byte count.** Each packet carries about 42 bytes of headers (14 Ethernet, 20 IP, 8 UDP) that the application does not count. Throughput figures will also differ slightly, because the headers add bytes and the two measurement time windows differ.
 - Under normal conditions in this setup, little or no packet loss is expected. Loss detection is verified with a deliberate test setting that drops a fraction of packets at the receiver.
