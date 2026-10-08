@@ -13,7 +13,8 @@ from network.topology import build
 
 def run_integration_test():
     print("Clearing old metrics...")
-    # Delete app results and target Gyanesh's actual CSV file
+    
+    # Delete app results and target the actual controller CSV file
     stats_file = REPO_ROOT / "network" / "results" / "flow_stats.csv"
     os.system("rm -f /tmp/app_results.json")
     if stats_file.exists():
@@ -31,13 +32,11 @@ def run_integration_test():
     sender_script = REPO_ROOT / "app" / "sender.py"
     
     print("Starting UDP Receiver on h2...")
-    # Inject absolute script path into the Mininet command
     h2.cmd(f'python3 {receiver_script} --out /tmp/app_results.json &')
     
     time.sleep(1) 
 
     print("Injecting UDP Traffic from h1...")
-    # Inject absolute script path into the Mininet command
     h1.cmd(f'python3 {sender_script} --dst 10.0.0.2 --rate 100 --size 1000 --duration 10')
 
     print("Transmission complete. Waiting 5 seconds for final controller polling...")
