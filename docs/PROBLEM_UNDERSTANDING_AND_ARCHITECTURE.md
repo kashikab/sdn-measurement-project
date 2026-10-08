@@ -106,7 +106,7 @@ This project generates UDP traffic, measures it both ways, and compares the two 
 
 ### 2.6 Architecture Diagram
 
-![Architecture](docs/topology.png)
+![Architecture](topology.png)
 
 ```mermaid
 flowchart LR
@@ -139,37 +139,3 @@ flowchart LR
 | Kashika B (PES1UG25CS244) | Integration and comparison; architecture document; end-to-end tests and demonstration. |
 
 All three members contributed to the design and test cases.
-
-
----
-
-## 5. Repository Layout
-
-| Folder | Contents |
-|---|---|
-| `app/` | `sender.py` and `receiver.py`, the UDP measurement application |
-| `network/` | `topology.py` (Mininet) and `controller.py` (Ryu SDN controller) |
-| `integration/` | `run_demo.py`, runs the application inside the Mininet network |
-| `docs/` | Detailed documentation: [application and test cases](docs/APP_TESTS_AND_README_SECTION.md), [network side](docs/NETWORK_README.md) |
-| `results/` | Screenshots and sample output from the tests |
-
-## 6. How to Run (summary)
-
-1. Start the controller: `cd network && PYTHONPATH=. ryu-manager controller.py`
-2. In another terminal, from the repo root: `sudo mn -c`, then `sudo python3 integration/run_demo.py`
-3. The application results are written to `/tmp/app_results.json` and the switch counters to `network/results/flow_stats.csv`.
-
-Full setup steps are in [docs/NETWORK_README.md](docs/NETWORK_README.md); application options are in [docs/APP_TESTS_AND_README_SECTION.md](docs/APP_TESTS_AND_README_SECTION.md).
-
-## 7. Test Results (summary)
-
-| ID | Test | Result |
-|---|---|---|
-| A1 | Normal transfer (loopback) | 1000 sent, 1000 received, 0% loss |
-| A2 | Forced loss (`--drop-every 10`) | 10.00% loss detected |
-| A3 | Invalid arguments | Clear error each time, nothing sent |
-| A4 | Two senders at once | Separate correct results per sender |
-| A5 | Inside Mininet, no controller | 1000/1000, 0% loss |
-| A6 | Inside Mininet with the SDN controller | App 1000/1000; switch counted 1005 packets, 1,047,210 bytes (1000 data + 5 end-marker copies, 1042 bytes each) |
-
-Details and screenshots: [docs/APP_TESTS_AND_README_SECTION.md](docs/APP_TESTS_AND_README_SECTION.md) and `results/`.
