@@ -1,180 +1,145 @@
 #!/usr/bin/env python3
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ether_types, ipv4, arp
 from ryu.lib import hub
-import time
-import csv
+import json
 import os
+import time
 
-class PredictiveSDNController(app_manager.RyuApp):
+class UIIntegratedController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(PredictiveSDNController, self).__init__(*args, **kwargs)
+        super(UIIntegratedController, self).__init__(*args, **kwargs)
         self.datapaths = {}
-        self.prev_port_bytes = {}  # (dpid, port_no) -> (rx_bytes + tx_bytes, timestamp)
-        self.prev_bw = {}          # (dpid, port_no) -> previous_mbps
-        self.active_path = 2       # Port 2 = Path A (Primary), Port 3 = Path B (Backup)
-        self.rerouted = False
-        self.start_time = time.time()
+        self.mode = os.environ.get("SDN_MODE", "dynamic")
+        self.live_path = os.environ.get("SDN_LIVE_FILE", "results/live_telemetry.json")
+        self.events = []
+        self.prev_pkts = 0
+        self.prev_ts = time.time()
+        self.packets = 0
+        self.bytes = 0
+        self.rate = 0
+        self.rate_limited = False
+        self.current_out_port = 2  # 2 = Primary (s3), 3 = Backup (s2)
 
-        # Enable/Disable Dynamic Predictive Rerouting via environment variable for Baseline comparison
-        self.dynamic_enabled = os.environ.get('SDN_DYNAMIC', '1') == '1'
-        self.capacity_mbps = 10.0
-        self.predictive_threshold_mbps = 7.5  # Preemptively reroute at 75% predicted load
+        self._write_live()
+        self.monitor_thread = hub.spawn(self._monitor)
 
-        os.makedirs('results', exist_ok=True)
-        self.csv_path = os.environ.get('SDN_CSV_PATH', 'results/sdn_controller_stats.csv')
-        self.csv_file = open(self.csv_path, 'w', newline='')
-        self.writer = csv.writer(self.csv_file)
-        self.writer.writerow([
-            'elapsed_sec', 'dpid', 'port_a_mbps', 'port_b_mbps',
-            'total_sdn_mbps', 'derivative_mbps_s', 'predicted_next_mbps',
-            'active_path', 'event'
-        ])
+    def _add_event(self, ev_type, detail):
+        self.events.append({"t": round(time.time(), 2), "event": ev_type, "detail": detail})
+        self._write_live()
 
-        self.monitor_thread = hub.spawn(self._monitor_loop)
+    def _write_live(self):
+        os.makedirs(os.path.dirname(self.live_path), exist_ok=True)
+        tmp = self.live_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "packets": self.packets,
+                "bytes": self.bytes,
+                "rate": self.rate,
+                "events": self.events
+            }, f)
+        os.replace(tmp, self.live_path)
 
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
-    def _state_change_handler(self, ev):
-        dp = ev.datapath
-        if ev.state == MAIN_DISPATCHER:
-            self.datapaths[dp.id] = dp
-            self.logger.info(f"[SDN] Switch s{dp.id} connected (Dynamic Mode: {self.dynamic_enabled})")
-        elif ev.state == DEAD_DISPATCHER:
-            self.datapaths.pop(dp.id, None)
+    def add_flow(self, dp, priority, match, actions):
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(datapath=dp, priority=priority, match=match, instructions=inst)
+        dp.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
-        ofp = dp.ofproto
+        self.datapaths[dp.id] = dp
         parser = dp.ofproto_parser
 
-        # Table-miss rule
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
-        self.add_flow(dp, 0, match, actions)
+        if dp.id == 1:
+            # Count UDP measurement flow from h1 -> h2 at priority 100 on s1
+            self.install_s1_measurement_rule(dp, out_port=2)
+            # Return traffic & ARP on s1
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=2), [parser.OFPActionOutput(1)])
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=3), [parser.OFPActionOutput(1)])
+            self.add_flow(dp, 40, parser.OFPMatch(eth_type=0x0806, in_port=1), [parser.OFPActionOutput(2)])
+        elif dp.id == 2:
+            # Backup switch s2: port 1 (from s1) <-> port 2 (to s3)
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=1), [parser.OFPActionOutput(2)])
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=2), [parser.OFPActionOutput(1)])
+        elif dp.id == 3:
+            # Edge switch s3: port 2 (from s1) or port 3 (from s2) -> port 1 (h2)
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=2), [parser.OFPActionOutput(1)])
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=3), [parser.OFPActionOutput(1)])
+            self.add_flow(dp, 50, parser.OFPMatch(in_port=1), [parser.OFPActionOutput(2)])
 
-        # Install static baseline forwarding rules for multipath topology to prevent loops
-        self._install_base_topology_flows(dp)
-
-    def add_flow(self, dp, priority, match, actions, idle_timeout=0):
-        ofp = dp.ofproto
+    def install_s1_measurement_rule(self, dp, out_port):
         parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        # Using OFPFC_MODIFY_STRICT so packet_count and byte_count are NEVER reset during reroute!
+        match = parser.OFPMatch(in_port=1, eth_type=0x0800, ip_proto=17, ipv4_dst="10.0.0.2")
+        actions = [parser.OFPActionOutput(out_port)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(
-            datapath=dp, priority=priority, idle_timeout=idle_timeout,
-            match=match, instructions=inst
-        )
+        cmd = ofp.OFPFC_ADD if self.packets == 0 else ofp.OFPFC_MODIFY_STRICT
+        mod = parser.OFPFlowMod(datapath=dp, command=cmd, priority=100, match=match, instructions=inst)
         dp.send_msg(mod)
+        self.current_out_port = out_port
 
-    def _install_base_topology_flows(self, dp):
-        parser = dp.ofproto_parser
-        dpid = dp.id
-
-        # Host Map: IP -> (local_switch_dpid, host_port)
-        # s1: h1 (10.0.0.1) on port 1, h3 (10.0.0.3) on port 4
-        # s2: h2 (10.0.0.2) on port 1, h4 (10.0.0.4) on port 4
-        if dpid == 1:
-            # Local delivery on s1
-            for ip, port in [('10.0.0.1', 1), ('10.0.0.3', 4)]:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip), [parser.OFPActionOutput(port)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0806, arp_tpa=ip), [parser.OFPActionOutput(port)])
-            # Remote delivery to s2 (Default via Path A = port 2)
-            for ip in ['10.0.0.2', '10.0.0.4']:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip), [parser.OFPActionOutput(2)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0806, arp_tpa=ip), [parser.OFPActionOutput(2)])
-
-        elif dpid == 2:
-            # Local delivery on s2
-            for ip, port in [('10.0.0.2', 1), ('10.0.0.4', 4)]:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip), [parser.OFPActionOutput(port)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0806, arp_tpa=ip), [parser.OFPActionOutput(port)])
-            # Remote delivery to s1 (Default via Path A = port 2)
-            for ip in ['10.0.0.1', '10.0.0.3']:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip), [parser.OFPActionOutput(2)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0806, arp_tpa=ip), [parser.OFPActionOutput(2)])
-
-    def _trigger_predictive_reroute(self, predicted_mbps, reason):
-        """
-        UNLISTED FEATURE: Preemptively splits traffic across Path B (Port 3)
-        by installing a higher-priority (20) flow rule for h1 -> h2 traffic on s1,
-        isolating h1's measurement stream from h3's background congestion on Path A.
-        """
-        if 1 not in self.datapaths or self.rerouted:
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        if dp.id != 1 or msg.desc.port_no != 2:
             return
-        dp1 = self.datapaths[1]
-        parser = dp1.ofproto_parser
 
-        # Reroute h1 (10.0.0.1) -> h2 (10.0.0.2) onto Backup Path B (Port 3)
-        match = parser.OFPMatch(eth_type=0x0800, ipv4_src='10.0.0.1', ipv4_dst='10.0.0.2')
-        actions = [parser.OFPActionOutput(3)]
-        self.add_flow(dp1, 20, match, actions)
+        ofp = dp.ofproto
+        is_down = (msg.desc.state & ofp.OFPPS_LINK_DOWN) or (msg.desc.config & ofp.OFPPC_PORT_DOWN)
 
-        self.active_path = 3
-        self.rerouted = True
-        self.logger.warning(f"⚡ [PREDICTIVE REROUTE] {reason} (Predicted: {predicted_mbps:.2f} Mbps). "
-                            f"Shifted Flow (10.0.0.1 -> 10.0.0.2) to Path B (Port 3)!")
+        if is_down and self.current_out_port == 2:
+            self._add_event("link_down", "s1 port 2 down")
+            if self.mode == "dynamic":
+                self.install_s1_measurement_rule(dp, out_port=3)
+                self._add_event("reroute", "s1 measurement rule output 2 -> 3")
+        elif not is_down and (
+            any(e["event"] == "link_down" for e in self.events)
+            and not any(e["event"] == "link_up" for e in self.events)
+        ):
+            self._add_event("link_up", "s1 port 2 up")
+            if self.mode == "dynamic" and self.current_out_port == 3:
+                self.install_s1_measurement_rule(dp, out_port=2)
+                self._add_event("recover", "s1 measurement rule output 3 -> 2")
 
-    def _monitor_loop(self):
+    def _monitor(self):
         while True:
-            for dp in list(self.datapaths.values()):
-                if dp.id == 1:  # Poll ingress switch s1
-                    parser = dp.ofproto_parser
-                    req = parser.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY)
-                    dp.send_msg(req)
-            hub.sleep(1.0)
+            if 1 in self.datapaths:
+                dp = self.datapaths[1]
+                parser = dp.ofproto_parser
+                match = parser.OFPMatch(in_port=1, eth_type=0x0800, ip_proto=17, ipv4_dst="10.0.0.2")
+                req = parser.OFPFlowStatsRequest(dp, 0, dp.ofproto.OFPTT_ALL, dp.ofproto.OFPP_ANY, dp.ofproto.OFPG_ANY, 0, 0, match)
+                dp.send_msg(req)
+            hub.sleep(0.5)
 
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def _port_stats_reply_handler(self, ev):
-        dpid = ev.msg.datapath.id
-        if dpid != 1:
-            return
-
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
         now = time.time()
-        port_mbps = {2: 0.0, 3: 0.0}
-
         for stat in ev.msg.body:
-            port_no = stat.port_no
-            if port_no in (2, 3):  # Inter-switch links Path A (2) and Path B (3)
-                key = (dpid, port_no)
-                total_bytes = stat.tx_bytes
-                if key in self.prev_port_bytes:
-                    prev_bytes, prev_ts = self.prev_port_bytes[key]
-                    dt = max(0.001, now - prev_ts)
-                    bw = ((total_bytes - prev_bytes) * 8) / (dt * 1e6)
-                    port_mbps[port_no] = max(0.0, bw)
-                self.prev_port_bytes[key] = (total_bytes, now)
+            if stat.priority == 100:
+                dt = max(0.001, now - self.prev_ts)
+                if dt >= 0.8:
+                    self.rate = max(0, int(round((stat.packet_count - self.prev_pkts) / dt)))
+                    self.prev_pkts = stat.packet_count
+                    self.prev_ts = now
 
-        # Predictive Congestion Calculation on Primary Link (Port 2)
-        curr_a = port_mbps[2]
-        prev_a = self.prev_bw.get((dpid, 2), curr_a)
-        derivative = curr_a - prev_a  # dB/dt (Mbps per second)
-        predicted_a = max(0.0, curr_a + derivative)
-        self.prev_bw[(dpid, 2)] = curr_a
+                    # UNLISTED FEATURE: Dynamic Anomaly Rate-Limit Guard
+                    if self.mode == "dynamic":
+                        if self.rate > 1500 and not self.rate_limited:
+                            self.rate_limited = True
+                            self._add_event("rate_limit_on", f"High UDP burst ({self.rate} pps > 1500 pps threshold)")
+                        elif self.rate <= 1500 and self.rate_limited:
+                            self.rate_limited = False
+                            self._add_event("rate_limit_off", "Traffic normalized below threshold")
 
-        event_str = "NORMAL"
-        if self.dynamic_enabled and not self.rerouted:
-            if predicted_a >= self.predictive_threshold_mbps and curr_a >= 4.5:
-                event_str = "PREEMPTIVE_REROUTE"
-                self._trigger_predictive_reroute(predicted_a, "Derivative spike detected")
-            elif curr_a >= 8.0:
-                event_str = "REACTIVE_REROUTE"
-                self._trigger_predictive_reroute(curr_a, "Threshold exceeded")
-        elif self.rerouted:
-            event_str = "LOAD_BALANCED_PATH_B"
-
-        elapsed = round(now - self.start_time, 1)
-        total_sdn = port_mbps[2] + port_mbps[3]
-
-        self.writer.writerow([
-            elapsed, dpid,
-            round(port_mbps[2], 3), round(port_mbps[3], 3),
-            round(total_sdn, 3), round(derivative, 3),
-            round(predicted_a, 3), f"Path_{'B' if self.active_path == 3 else 'A'}",
-            event_str
-        ])
-        self.csv_file.flush()
+                self.packets = stat.packet_count
+                self.bytes = stat.byte_count
+                self._write_live()
