@@ -1,125 +1,99 @@
 #!/usr/bin/env python3
-"""UDP sender for the Bandwidth Meter and Traffic Analyzer (Person 1).
-
-Sends numbered UDP packets at a fixed rate for a fixed duration, counts what
-it sends, then sends an end-marker packet carrying the total sent.
-"""
-import argparse
-import json
 import socket
-import struct
-import sys
 import time
+import struct
+import random
+import os
+import argparse
+import csv
 
-END_SEQ = 0xFFFFFFFF
-HEADER = 4            # sequence number bytes
-MIN_SIZE = 12         # end marker needs 12 bytes; keep all packets at least this big
+HEADER_FORMAT = '!IId'  # seq_num (uint32), pkt_size (uint32), timestamp (double)
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-
-def parse_args():
-    ap = argparse.ArgumentParser(description="UDP bandwidth sender")
-    ap.add_argument("--dst", required=True, help="destination IP address")
-    ap.add_argument("--port", type=int, default=5001, help="destination UDP port (default 5001)")
-    ap.add_argument("--rate", type=float, default=100.0, help="packets per second (default 100)")
-    ap.add_argument("--size", type=int, default=1000, help="packet size in bytes (default 1000)")
-    ap.add_argument("--duration", type=float, default=10.0, help="seconds to send (default 10)")
-    ap.add_argument("--out", default="", help="optional JSON file for sender results")
-    ap.add_argument("--src", default="", help="optional local source IP to bind (for testing)")
-    return ap.parse_args()
-
-
-def validate(args):
-    try:
-        socket.inet_aton(args.dst)
-    except OSError:
-        sys.exit(f"error: '{args.dst}' is not a valid IPv4 address")
-    if not (1 <= args.port <= 65535):
-        sys.exit("error: port must be between 1 and 65535")
-    if args.rate <= 0:
-        sys.exit("error: --rate must be greater than 0")
-    if args.duration <= 0:
-        sys.exit("error: --duration must be greater than 0")
-    if not (MIN_SIZE <= args.size <= 1472):
-        sys.exit(f"error: --size must be between {MIN_SIZE} and 1472 bytes "
-                 "(1472 keeps the packet inside one Ethernet frame)")
-
-
-def main():
-    args = parse_args()
-    validate(args)
-
+def run_sender(target_ip, target_port, duration, mode, min_size, max_size, rate_mbps, csv_path, flow_id):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    if args.src:
-        try:
-            sock.bind((args.src, 0))
-        except OSError as e:
-            sys.exit(f"error: cannot bind source address {args.src}: {e}")
-    padding = b"x" * (args.size - HEADER)
-    interval = 1.0 / args.rate
-    dest = (args.dst, args.port)
+    start_time = time.time()
+    seq = 0
+    total_bytes = 0
 
-    sent_packets = 0
-    sent_bytes = 0
-    errors = 0
-    total = max(1, round(args.rate * args.duration))   # exact packet count
-    start = time.time()
-    next_t = start
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    csv_file = open(csv_path, 'w', newline='')
+    writer = csv.writer(csv_file)
+    writer.writerow(['timestamp', 'seq', 'size_bytes', 'instant_rate_mbps', 'mode', 'flow_id'])
 
-    print(f"[sender] {args.rate:g} pkt/s, {args.size} B, {args.duration:g} s "
-          f"({total} packets) -> {args.dst}:{args.port}", flush=True)
+    print(f"[{flow_id}] Sending to {target_ip}:{target_port} | Mode: {mode} | Duration: {duration}s")
+
+    window_start = start_time
+    window_bytes = 0
 
     try:
-        for i in range(total):
-            pkt = struct.pack("!I", sent_packets) + padding
-            try:
-                sock.sendto(pkt, dest)
-                sent_packets += 1
-                sent_bytes += len(pkt)
-            except OSError as e:
-                errors += 1
-                if errors == 1:
-                    print(f"[sender] send error: {e} (will keep trying)", file=sys.stderr)
-                if errors >= 50:
-                    print("[sender] too many send errors, giving up", file=sys.stderr)
-                    break
-            next_t = start + (i + 1) * interval   # no drift: always relative to start
-            delay = next_t - time.time()
-            if delay > 0:
-                time.sleep(delay)
-    except KeyboardInterrupt:
-        print("\n[sender] interrupted", flush=True)
+        while time.time() - start_time < duration:
+            now = time.time()
+            elapsed = now - start_time
 
-    elapsed = time.time() - start
+            # Determine packet size & inter-packet delay based on mode
+            if mode == 'fixed':
+                pkt_size = max_size
+                target_rate = rate_mbps
+                sleep_time = (pkt_size * 8) / (target_rate * 1e6)
+            elif mode == 'random':
+                pkt_size = random.randint(min_size, max_size)
+                # Randomize instantaneous target rate around rate_mbps (+/- 50%)
+                target_rate = max(0.5, random.uniform(rate_mbps * 0.5, rate_mbps * 1.5))
+                sleep_time = (pkt_size * 8) / (target_rate * 1e6)
+            elif mode == 'ramp':
+                pkt_size = random.randint(min_size, max_size)
+                # Linearly ramp traffic from 1 Mbps up to rate_mbps over the run duration
+                progress = min(1.0, elapsed / (duration * 0.75))
+                target_rate = 1.0 + progress * (rate_mbps - 1.0)
+                sleep_time = (pkt_size * 8) / (target_rate * 1e6)
 
-    # End marker: sent several times because UDP may lose it. The receiver
-    # uses the first one it sees and ignores later copies.
-    marker = struct.pack("!IQ", END_SEQ, sent_packets)
-    marker += b"\x00" * (args.size - len(marker))
-    for _ in range(5):
-        try:
-            sock.sendto(marker, dest)
-        except OSError:
-            pass
-        time.sleep(0.05)
-    sock.close()
+            pkt_size = max(pkt_size, HEADER_SIZE + 4)
+            payload_size = pkt_size - HEADER_SIZE
 
-    offered_bps = sent_bytes * 8 / elapsed if elapsed > 0 else 0.0
-    print("\n===== Sender summary =====")
-    print(f"  Packets sent    : {sent_packets}")
-    print(f"  Bytes sent      : {sent_bytes}")
-    print(f"  Send errors     : {errors}")
-    print(f"  Elapsed         : {elapsed:.3f} s")
-    print(f"  Offered rate    : {offered_bps / 1e6:.3f} Mbit/s")
+            header = struct.pack(HEADER_FORMAT, seq, pkt_size, now)
+            payload = os.urandom(payload_size)
+            sock.sendto(header + payload, (target_ip, target_port))
 
-    if args.out:
-        try:
-            with open(args.out, "w") as f:
-                json.dump({"packets_sent": sent_packets, "bytes_sent": sent_bytes,
-                           "send_errors": errors, "elapsed_s": elapsed,
-                           "offered_bps": offered_bps}, f, indent=2)
-        except OSError as e:
-            print(f"[sender] warning: could not write {args.out}: {e}", file=sys.stderr)
+            seq += 1
+            total_bytes += pkt_size
+            window_bytes += pkt_size
 
+            # Log application send metrics every 0.5 seconds
+            if now - window_start >= 0.5:
+                inst_mbps = (window_bytes * 8) / ((now - window_start) * 1e6)
+                writer.writerow([round(now - start_time, 2), seq, pkt_size, round(inst_mbps, 3), mode, flow_id])
+                csv_file.flush()
+                window_start = now
+                window_bytes = 0
 
-if __name__ == "__main__":
-    main()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        # Send 3 EOF termination packets (seq = 0xFFFFFFFF)
+        eof_pkt = struct.pack(HEADER_FORMAT, 0xFFFFFFFF, HEADER_SIZE, time.time())
+        for _ in range(3):
+            sock.sendto(eof_pkt, (target_ip, target_port))
+            time.sleep(0.02)
+
+    finally:
+        total_time = max(0.001, time.time() - start_time)
+        avg_mbps = (total_bytes * 8) / (total_time * 1e6)
+        print(f"[{flow_id}] Done. Sent {seq} packets ({total_bytes} B) in {total_time:.2f}s | Avg: {avg_mbps:.2f} Mbps")
+        csv_file.close()
+        sock.close()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Randomized UDP Traffic Sender")
+    parser.add_argument('--ip', default='10.0.0.2', help='Receiver IP')
+    parser.add_argument('--port', type=int, default=9999, help='Receiver UDP Port')
+    parser.add_argument('--duration', type=int, default=20, help='Duration in seconds')
+    parser.add_argument('--mode', choices=['fixed', 'random', 'ramp'], default='random')
+    parser.add_argument('--min-size', type=int, default=256, help='Minimum UDP payload size')
+    parser.add_argument('--max-size', type=int, default=1400, help='Maximum UDP payload size')
+    parser.add_argument('--rate', type=float, default=6.0, help='Target rate in Mbps')
+    parser.add_argument('--csv', default='results/app_sender.csv', help='Output CSV path')
+    parser.add_argument('--id', default='h1_main', help='Flow Identifier')
+    args = parser.parse_args()
+
+    run_sender(args.ip, args.port, args.duration, args.mode, args.min_size, args.max_size, args.rate, args.csv, args.id)
