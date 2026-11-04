@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UDP Bandwidth Meter and Traffic Analyzer</title>
+<style>
+:root{--bg:#06050d;--panel:#0d0b1c;--panel2:#15112e;--ink:#ecebff;--mute:#8f8bb9;--line:#2a2554;--soft:#110e26;--dyn:#18c4ff;--dyn2:#2f6bff;--sta:#b45cff;--sta2:#7c3aed;--bad:#ff3d78;--ok:#2dff9a;--warn:#ffd23f;--idle:#3a3566;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);background-color:var(--bg);background-image:linear-gradient(rgba(120,110,255,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(120,110,255,.07) 1px,transparent 1px),linear-gradient(115deg,rgba(47,107,255,.16),transparent 32%,transparent 68%,rgba(180,92,255,.16));background-size:32px 32px,32px 32px,100% 100%;background-attachment:fixed;font:14px/1.45 system-ui,-apple-system,"Segoe UI",Ubuntu,Roboto,sans-serif;font-variant-numeric:tabular-nums}
+header{position:relative;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 24px;background:rgba(10,8,24,.88);border-bottom:1px solid var(--line)}
+header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:linear-gradient(90deg,var(--dyn2),var(--sta),var(--ok));box-shadow:0 0 14px rgba(180,92,255,.7)}
+.brand{display:flex;align-items:center;gap:14px}
+.logo{width:42px;height:34px;flex:none}
+h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
+header p{margin:2px 0 0;color:var(--mute);font-size:12.5px}
+.tags{display:flex;gap:8px;align-items:center}
+.tag{display:inline-block;padding:2px 8px;border:1px solid var(--line);border-radius:0;font-size:12px;font-weight:600;background:var(--soft);color:var(--mute);white-space:nowrap}
+.tag.ok{color:var(--ok);background:rgba(45,255,154,.08);border-color:rgba(45,255,154,.45)}
+.tag.bad{color:var(--bad);background:rgba(255,61,120,.09);border-color:rgba(255,61,120,.5)}
+.tag.run{color:var(--dyn);background:rgba(24,196,255,.09);border-color:rgba(24,196,255,.5)}
+.tag.sta{color:var(--sta);background:rgba(180,92,255,.11);border-color:rgba(180,92,255,.55)}
+.tag.warn{color:var(--warn);background:rgba(255,210,63,.08);border-color:rgba(255,210,63,.45)}
+.app{display:grid;grid-template-columns:320px minmax(0,1fr)}
+aside{background:rgba(10,8,24,.8);border-right:1px solid var(--line);padding:8px 24px 24px}
+.grp{border-bottom:1px solid var(--line);padding:16px 0 4px}
+.grp h2{display:flex;align-items:center;font-size:13px;margin:0 0 12px;font-weight:650}
+.grp h2::before,.pn>h3::before{content:"";width:5px;height:13px;margin-right:10px;background:linear-gradient(var(--dyn),var(--sta));transform:skewX(-20deg);flex:none}
+.f{margin-bottom:14px}
+label,.lb{display:block;font-size:12.5px;color:var(--mute);margin-bottom:4px}
+.inp{display:flex;border:1px solid var(--line);background:#09071a}
+.inp:focus-within{outline:2px solid var(--dyn);outline-offset:-1px;box-shadow:0 0 12px rgba(24,196,255,.35)}
+.inp input{flex:1;min-width:0;border:0;background:transparent;padding:8px 10px;font:inherit;color:var(--ink);outline:0}
+.inp input::placeholder{color:#5d5890}
+.inp span{padding:8px 10px;color:var(--mute);border-left:1px solid var(--line);background:var(--soft);font-size:12.5px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;border:1px solid var(--line);background:#09071a}
+.seg label{margin:0;position:relative;color:var(--ink)}
+.seg input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+.seg span{display:block;text-align:center;padding:8px 6px}
+.seg label+label span{border-left:1px solid var(--line)}
+.seg input:checked+span{background:linear-gradient(135deg,var(--dyn2),var(--sta2));color:#fff;box-shadow:0 0 14px rgba(124,58,237,.55)}
+.seg.mode input[value=dynamic]:checked+span{background:linear-gradient(135deg,var(--dyn2),var(--dyn));box-shadow:0 0 14px rgba(24,196,255,.5)}
+.seg.mode input[value=static]:checked+span{background:linear-gradient(135deg,var(--sta2),var(--sta));box-shadow:0 0 14px rgba(180,92,255,.55)}
+.seg input:focus-visible+span{outline:2px solid #fff;outline-offset:-3px}
+#err{color:var(--bad);min-height:20px;margin:14px 0 8px;font-size:13px}
+.run{width:100%;padding:12px;border:0;background:linear-gradient(100deg,var(--dyn2),var(--sta));color:#fff;font:inherit;font-weight:700;letter-spacing:.01em;cursor:pointer;clip-path:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px)}
+.run:hover:not(:disabled){filter:brightness(1.18)}
+.run:disabled{background:#241f4a;color:var(--mute);cursor:not-allowed}
+.run:focus-visible,.tabs button:focus-visible{outline:2px solid #fff;outline-offset:2px}
+main{padding:20px 24px 40px;min-width:0}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px}
+.tabs button{background:none;border:0;padding:10px 14px;font:inherit;color:var(--mute);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button:hover{color:var(--ink)}
+.tabs button[aria-selected=true]{color:#fff;border-bottom-color:var(--dyn);font-weight:650;box-shadow:0 10px 14px -10px var(--dyn)}
+.pn{position:relative;background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);margin-bottom:16px}
+.pn::before,.pn::after{content:"";position:absolute;width:16px;height:16px;pointer-events:none}
+.pn::before{top:-1px;left:-1px;border-top:2px solid var(--dyn);border-left:2px solid var(--dyn)}
+.pn::after{bottom:-1px;right:-1px;border-bottom:2px solid var(--sta);border-right:2px solid var(--sta)}
+.pn>h3{display:flex;align-items:center;margin:0;padding:12px 16px;border-bottom:1px solid var(--line);font-size:13.5px;font-weight:650}
+.pb{padding:12px 16px 16px}
+.leg{display:flex;gap:14px;margin-left:auto;font-weight:400;color:var(--mute);font-size:12.5px}
+.leg i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr)}
+.stats div{position:relative;padding:16px;border-left:1px solid var(--line)}
+.stats div:first-child{border-left:0}
+.stats div::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--a);box-shadow:0 0 12px var(--a)}
+.stats b{display:block;font-size:24px;font-weight:600;letter-spacing:-.01em}
+.stats small{color:var(--mute);font-size:12px}
+svg{display:block;width:100%;height:auto}
+.g{stroke:var(--line);stroke-width:1;stroke-dasharray:2 4}
+.ax{fill:var(--mute);font-size:11px}
+.vl{fill:var(--ink);font-size:12px;font-weight:600}
+.ln{fill:none;stroke:url(#cl);stroke-width:2.5;stroke-linejoin:round;filter:url(#cg)}
+.nd{fill:#08061a;stroke:var(--dyn2);stroke-width:1.5}
+.nd.hi{stroke:var(--sta)}
+.nt{font-size:13px;font-weight:650;fill:var(--ink);text-anchor:middle}
+.ns{font-size:11px;fill:var(--mute);text-anchor:middle}
+.lk{stroke:var(--idle);stroke-width:3;fill:none}
+.lk.on{stroke:var(--dyn);filter:url(#tg)}
+.lk.off{stroke:var(--bad);stroke-dasharray:7 5;filter:url(#tg)}
+.ev{display:grid;grid-template-columns:70px 120px 1fr;gap:12px;align-items:center;padding:9px 16px;border-bottom:1px solid var(--line)}
+.ev:last-child,dl>*:nth-last-child(-n+2){border-bottom:0}
+.empty{padding:28px 16px;color:var(--mute)}
+.empty b{display:block;color:var(--ink);margin-bottom:2px}
+.sum{color:var(--mute);margin-bottom:12px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.two .pn,.charts .pn{margin-bottom:0}
+.two+.pn{margin-top:16px}
+dl{margin:0;display:grid;grid-template-columns:1fr auto}
+dt,dd{margin:0;padding:10px 16px;border-bottom:1px solid var(--line)}
+dd{text-align:right;font-weight:600}
+.ck{display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line)}
+.ck:last-child{border-bottom:0}
+.wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-weight:600;color:var(--mute);font-size:12.5px;background:var(--soft)}
+tbody tr:hover td{background:rgba(120,110,255,.08)}
+.n{text-align:right}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.note{padding:10px 24px;font-size:13px;background:rgba(255,210,63,.09);color:var(--warn);border-bottom:1px solid rgba(255,210,63,.35)}
+@media (max-width:900px){.app{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}.stats{grid-template-columns:repeat(2,1fr)}.stats div:nth-child(3){border-left:0}.two,.charts{grid-template-columns:1fr}header{flex-direction:column;align-items:flex-start}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 42 34" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#18c4ff"/><stop offset="1" stop-color="#b45cff"/></linearGradient></defs><g transform="translate(7 0) skewX(-14)" fill="url(#lg)"><rect x="0" y="24" width="6" height="10"/><rect x="9" y="17" width="6" height="17"/><rect x="18" y="10" width="6" height="24"/><rect x="27" y="0" width="6" height="34"/></g></svg>
+    <div>
+      <h1>UDP Bandwidth Meter and Traffic Analyzer</h1>
+      <p>Compare application counts with OpenFlow switch counters</p>
+    </div>
+  </div>
+  <div class="tags"><span id="demo" class="tag warn" hidden>Simulated data</span><span id="st" class="tag">Idle</span></div>
+</header>
+<div id="note" class="note" hidden>The server at /api is not reachable, so this page is showing simulated data. Start web/server.py with sudo to see real runs.</div>
+
+<div class="app">
+<aside>
+<form id="f" novalidate>
+  <section class="grp">
+    <h2>Controller</h2>
+    <div class="f"><span class="lb" id="lm">Mode</span>
+      <div class="seg mode" role="radiogroup" aria-labelledby="lm">
+        <label><input type="radio" name="mode" value="dynamic" checked><span>Dynamic</span></label>
+        <label><input type="radio" name="mode" value="static"><span>Static</span></label>
+      </div></div>
+    <div class="f"><label for="fail">Fail primary link at</label><div class="inp"><input id="fail" type="number" min="1" placeholder="No failure"><span>s</span></div></div>
+  </section>
+  <section class="grp">
+    <h2>Traffic</h2>
+    <div class="f"><span class="lb" id="lp">Packet sizes</span>
+      <div class="seg" role="radiogroup" aria-labelledby="lp">
+        <label><input type="radio" name="pattern" value="fixed" checked><span>Fixed</span></label>
+        <label><input type="radio" name="pattern" value="random"><span>Random</span></label>
+      </div></div>
+    <div class="f"><label for="rate">Rate</label><div class="inp"><input id="rate" type="number" value="100"><span>packets/s</span></div></div>
+    <div class="f" id="gfix"><label for="size">Packet size</label><div class="inp"><input id="size" type="number" value="1000"><span>bytes</span></div></div>
+    <div id="grnd" hidden>
+      <div class="row2 f">
+        <div><label for="smin">Smallest</label><div class="inp"><input id="smin" type="number" value="200"><span>B</span></div></div>
+        <div><label for="smax">Largest</label><div class="inp"><input id="smax" type="number" value="1472"><span>B</span></div></div>
+      </div>
+      <div class="f"><label for="seed">Seed (repeats the same run)</label><div class="inp"><input id="seed" type="number" placeholder="Any"></div></div>
+    </div>
+    <div class="f"><label for="dur">Duration</label><div class="inp"><input id="dur" type="number" value="15"><span>s</span></div></div>
+  </section>
+  <section class="grp">
+    <h2>Network</h2>
+    <div class="f"><label for="loss">Loss on the h2 link</label><div class="inp"><input id="loss" type="number" value="0" step="0.5"><span>%</span></div></div>
+  </section>
+  <p id="err" role="alert"></p>
+  <button class="run" id="go" type="submit">Run experiment</button>
+</form>
+</aside>
+
+<main>
+  <div class="tabs" role="tablist">
+    <button role="tab" data-v="live" aria-selected="true">Live run</button>
+    <button role="tab" data-v="result" aria-selected="false">Result</button>
+    <button role="tab" data-v="compare" aria-selected="false">Comparison</button>
+  </div>
+
+  <section id="v-live">
+    <div class="pn"><h3>Network path <span class="leg"><span><i style="background:var(--dyn)"></i>Carrying traffic</span><span><i style="background:var(--bad)"></i>Failed</span><span><i style="background:var(--idle)"></i>Idle</span></span></h3><div class="pb" id="topo"></div></div>
+    <div class="pn stats" id="stats"></div>
+    <div class="pn"><h3>Switch rate, packets per second</h3><div class="pb" id="chart"></div></div>
+    <div class="pn"><h3>Controller events</h3><div id="evs"></div></div>
+  </section>
+
+  <section id="v-result" hidden><div id="res"></div></section>
+
+  <section id="v-compare" hidden>
+    <p class="sum" id="csum"></p>
+    <div class="charts" id="cbars"></div>
+    <div class="pn" style="margin-top:16px"><h3>All runs <span class="leg"><span><i style="background:var(--sta)"></i>Static</span><span><i style="background:var(--dyn)"></i>Dynamic</span></span></h3><div class="wrap" id="tbl"></div></div>
+  </section>
+</main>
+</div>
+
+<script>
+/* ---- API adapter: the only place that knows the server's response shapes ----
+   Assumed shapes (confirm with Harsh):
+   POST /api/run        -> {run_id}
+   GET  /api/status     -> {state: idle|running|done, run_id, elapsed_s}
+   GET  /api/live       -> {packets, bytes, rate, events:[{t, event, detail}]}
+   GET  /api/result/<id>-> {row:{...experiments.csv columns}, events:[...]}
+   GET  /api/results    -> [rows] or {rows:[...]}                              */
+const $=s=>document.querySelector(s);
+const api=async(p,o)=>{const r=await fetch(p,o);if(!r.ok)throw new Error(p+' returned '+r.status);return r.json()};
+const num=v=>v===''||v==null||isNaN(v)?null:Number(v);
+const fmt=(n,d=0)=>n==null||isNaN(n)?'–':Number(n).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d});
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const LBL={link_down:'Link down',reroute:'Reroute',link_up:'Link up',recover:'Recover',rate_limit_on:'Rate limit on',rate_limit_off:'Rate limit off'};
+const CLS={link_down:'bad',reroute:'run',link_up:'ok',recover:'ok'};
+let running=false,demo=false,runId=null,series=[],evs=[],t0=0,timer=null,cfg=null,S=null,rows=[],demoRows=[],last={};
+
+/* ---- simulated backend, used only when the server is unreachable ---- */
+function mkRow(c,pk,out,grp,id){
+  const avg=c.pattern==='random'?(c.size_min+c.size_max)/2:c.size,lost=Math.min(pk,out*c.rate),rcv=Math.round((pk-lost)*(1-c.loss_pct/100));
+  return{run_id:id,group:grp,mode:c.mode,rate_pps:c.rate,size_bytes:c.pattern==='random'?'':c.size,duration_s:c.duration,loss_pct:c.loss_pct,fail_at_s:c.fail_at_s??'',app_sent:pk,app_received:rcv,app_loss_pct:+(100-rcv/pk*100).toFixed(2),app_throughput_bps:Math.round(rcv*avg*8/c.duration),switch_packets:pk+5,switch_bytes:Math.round((pk+5)*(avg+42)),packets_check:'PASS',bytes_check:'PASS',outage_s:c.fail_at_s==null?'':+out.toFixed(1)};
+}
+function sim(c){
+  const fa=c.fail_at_s,up=fa==null?null:fa+6,o={id:demoRows.length+1,t:0,pk:0,by:0,rate:0,ev:[],out:0};
+  const avg=c.pattern==='random'?(c.size_min+c.size_max)/2:c.size,add=(e,d)=>o.ev.push({t:Date.now()/1000,event:e,detail:d});
+  o.tick=()=>{o.t++;const t=o.t;
+    if(t===fa){add('link_down','s1 port 2 down');if(c.mode==='dynamic')add('reroute','s1 measurement rule output 2 -> 3')}
+    if(t===up){add('link_up','s1 port 2 up');if(c.mode==='dynamic')add('recover','s1 measurement rule output 3 -> 2')}
+    o.rate=Math.round(c.rate*(.97+Math.random()*.06));o.pk+=o.rate;o.by+=o.rate*(avg+42);
+    if(fa!=null&&t>=fa&&t<up)o.out+=c.mode==='dynamic'?(t===fa?.5:0):1};
+  o.status=()=>({state:o.t>=c.duration?'done':'running',run_id:o.id,elapsed_s:o.t});
+  o.live=()=>({packets:o.pk,bytes:o.by,rate:o.rate,events:o.ev});
+  o.result=()=>{const r=mkRow(c,o.pk,o.out,'',o.id);demoRows.push(r);return{row:r,events:o.ev}};
+  return o;
+}
+['static','dynamic'].forEach(m=>[0,1,2].forEach(i=>demoRows.push(mkRow({mode:m,pattern:'fixed',rate:100,size:1000,duration:15,loss_pct:0,fail_at_s:5},1500,m==='static'?6:.4+i*.2,'D',demoRows.length+1))));
+
+/* ---- form ---- */
+function read(){
+  const g=id=>num($(id).value),rnd=document.querySelector('input[name=pattern]:checked').value==='random';
+  const c={mode:document.querySelector('input[name=mode]:checked').value,pattern:rnd?'random':'fixed',rate:g('#rate'),duration:g('#dur'),loss_pct:g('#loss')||0,fail_at_s:g('#fail')};
+  if(rnd){c.size_min=g('#smin');c.size_max=g('#smax');c.seed=g('#seed');c.size=c.size_max}else c.size=g('#size');
+  return c;
+}
+function check(c){
+  const ok=(v,a,b)=>v!=null&&v>=a&&v<=b;
+  if(!ok(c.rate,1,5000))return'Rate must be between 1 and 5000 packets per second.';
+  if(c.pattern==='fixed'){if(!ok(c.size,12,1472))return'Packet size must be 12 to 1472 bytes, the most that fits one Ethernet frame.'}
+  else{if(!ok(c.size_min,12,1472)||!ok(c.size_max,12,1472))return'Packet sizes must be 12 to 1472 bytes.';if(c.size_min>c.size_max)return'The smallest size cannot be larger than the largest size.'}
+  if(!ok(c.duration,5,120))return'Duration must be 5 to 120 seconds.';
+  if(!ok(c.loss_pct,0,50))return'Loss must be between 0 and 50 percent.';
+  if(c.fail_at_s!=null&&!ok(c.fail_at_s,1,c.duration-3))return'Set the failure at least 3 seconds before the run ends, or leave it empty.';
+  return'';
+}
+function lock(b){running=b;document.querySelectorAll('#f input,#go').forEach(e=>e.disabled=b);$('#go').textContent=b?'Running…':'Run experiment';topo()}
+function tag(t,c){const e=$('#st');e.textContent=t;e.className='tag '+(c||'')}
+function setDemo(b){demo=b;$('#demo').hidden=!b;$('#note').hidden=!b}
+function show(v){document.querySelectorAll('.tabs button').forEach(b=>b.setAttribute('aria-selected',b.dataset.v===v));['live','result','compare'].forEach(k=>$('#v-'+k).hidden=k!==v);if(v==='compare')compare()}
+
+/* ---- run flow ---- */
+async function run(e){
+  e.preventDefault();
+  const c=read(),m=check(c);$('#err').textContent=m;if(m)return;
+  cfg=c;series=[];evs=[];last={};
+  try{
+    if(demo)S=sim(c);else{const r=await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});runId=r.run_id}
+  }catch(x){$('#err').textContent='The run could not start: '+x.message;return}
+  lock(true);show('live');draw();timer=setInterval(poll,1000);poll();
+}
+async function poll(){
+  try{
+    let st,lv;
+    if(demo){S.tick();st=S.status();lv=S.live()}else[st,lv]=await Promise.all([api('/api/status'),api('/api/live')]);
+    const el=st.elapsed_s??series.length;
+    if(!series.length)t0=Date.now()/1000-el;
+    evs=(lv.events||[]).map(e=>({...e,rt:e.t-t0}));last=lv;
+    series.push({t:el,v:num(lv.rate)||0});
+    tag('Running '+Math.round(el)+' s of '+cfg.duration+' s','run');draw();
+    if(st.state==='done'){clearInterval(timer);await finish()}
+  }catch(x){clearInterval(timer);lock(false);tag('Error','bad');$('#err').textContent='Lost contact with the server: '+x.message}
+}
+async function finish(){
+  try{
+    const r=demo?S.result():await api('/api/result/'+runId),row=r.row||r;
+    if(r.events)evs=r.events.map(e=>({...e,rt:e.t-t0}));
+    draw();result(row);await loadRows();tag('Done','ok');show('result');
+  }catch(x){tag('Error','bad');$('#err').textContent='The result could not be loaded: '+x.message}
+  finally{lock(false)}
+}
+async function loadRows(){try{if(demo)rows=demoRows;else{const r=await api('/api/results');rows=Array.isArray(r)?r:r.rows||[]}}catch(x){rows=[]}}
+
+/* ---- rendering ---- */
+function draw(){stats();topo();chart();events()}
+function stats(){
+  const el=series.length?series[series.length-1].t:0,s=[['Switch packets',fmt(last.packets),'--dyn2'],['Switch bytes',fmt(last.bytes),'--sta'],['Rate, packets/s',fmt(last.rate),'--dyn'],['Elapsed',fmt(el)+' s','--ok']];
+  $('#stats').innerHTML=s.map(([k,v,a])=>`<div style="--a:var(${a})"><b>${v}</b><small>${k}</small></div>`).join('');
+}
+const calm=matchMedia('(prefers-reduced-motion:reduce)').matches;
+function topo(){
+  let down=false,rer=false;evs.forEach(e=>{if(e.event==='link_down')down=true;if(e.event==='link_up')down=false;if(e.event==='reroute')rer=true;if(e.event==='recover')rer=false});
+  const p=down?'off':'on',b=rer?'on':'';
+  const nd=(x,y,n,r,h)=>`<polygon class="nd ${h?'hi':''}" points="${x+9},${y} ${x+68},${y} ${x+68},${y+37} ${x+59},${y+46} ${x},${y+46} ${x},${y+9}"/><text class="nt" x="${x+34}" y="${y+20}">${n}</text><text class="ns" x="${x+34}" y="${y+36}">${r}</text>`;
+  const pk=d=>running&&!calm?[0,-.55].map(o=>`<rect x="-4" y="-4" width="8" height="8" fill="var(--ok)" filter="url(#tg)"><animateMotion dur="1.1s" begin="${o}s" repeatCount="indefinite" path="${d}"/></rect>`).join(''):'';
+  $('#topo').innerHTML=`<svg viewBox="0 0 700 215" role="img" aria-label="Network path from h1 through s1 and s3 to h2, with a backup path through s2"><defs><filter id="tg" filterUnits="userSpaceOnUse" x="0" y="0" width="700" height="215"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+  <line class="lk on" x1="92" y1="85" x2="190" y2="85"/><line class="lk on" x1="498" y1="85" x2="600" y2="85"/>
+  <line class="lk ${p}" x1="258" y1="85" x2="430" y2="85"/>
+  <polyline class="lk ${b}" points="224,108 224,165 310,165"/><polyline class="lk ${b}" points="378,165 464,165 464,108"/>
+  ${pk('M92 85L190 85')}${pk('M498 85L600 85')}${p==='on'?pk('M258 85L430 85'):''}${b?pk('M224 108L224 165L310 165')+pk('M378 165L464 165L464 108'):''}
+  ${nd(24,62,'h1','sender')}${nd(190,62,'s1','flow counters',1)}${nd(430,62,'s3','switch')}${nd(600,62,'h2','receiver')}${nd(310,142,'s2','backup switch')}
+  <text class="ax" x="344" y="74" text-anchor="middle">Primary path</text><text class="ax" x="344" y="200" text-anchor="middle">Backup path</text>
+  <text class="ax" x="262" y="102">port 2</text><text class="ax" x="230" y="130">port 3</text>
+  ${cfg&&cfg.loss_pct>0?`<text class="ax" x="549" y="74" text-anchor="middle" style="fill:var(--warn)">${fmt(cfg.loss_pct,1)}% loss</text>`:''}</svg>`;
+}
+function chart(){
+  const W=760,H=250,L=48,R=14,T=14,B=30,pw=W-L-R,ph=H-T-B,dur=cfg?cfg.duration:15,xm=Math.max(dur,series.length?series[series.length-1].t:0);
+  const mx=Math.max(10,Math.ceil(Math.max(cfg?cfg.rate:0,...series.map(p=>p.v))*1.15/10)*10),X=v=>L+v/xm*pw,Y=v=>T+ph-v/mx*ph;
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Switch packet rate over time"><defs><linearGradient id="ca" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#18c4ff" stop-opacity=".38"/><stop offset="1" stop-color="#b45cff" stop-opacity="0"/></linearGradient><linearGradient id="cl" gradientUnits="userSpaceOnUse" x1="${L}" y1="0" x2="${W-R}" y2="0"><stop offset="0" stop-color="#2f6bff"/><stop offset="1" stop-color="#18c4ff"/></linearGradient><filter id="cg" filterUnits="userSpaceOnUse" x="0" y="0" width="${W}" height="${H}"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>`;
+  for(let i=0;i<=4;i++){const v=mx*i/4;s+=`<line class="g" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax" x="${L-8}" y="${Y(v)+4}" text-anchor="end">${fmt(v)}</text>`}
+  const st=xm>60?20:xm>30?10:5;
+  for(let v=0;v<=xm;v+=st)s+=`<text class="ax" x="${X(v)}" y="${H-10}" text-anchor="middle">${v} s</text>`;
+  evs.filter(e=>e.event==='link_down'||e.event==='link_up').forEach(e=>{const c=e.event==='link_down'?'bad':'ok';s+=`<line x1="${X(e.rt)}" x2="${X(e.rt)}" y1="${T}" y2="${T+ph}" stroke="var(--${c})" stroke-width="1.5" stroke-dasharray="4 3"/><text class="ax" x="${X(e.rt)+5}" y="${T+11}" style="fill:var(--${c})">${LBL[e.event]}</text>`});
+  if(series.length){const pts=series.map(p=>X(p.t).toFixed(1)+','+Y(p.v).toFixed(1));s+=`<polygon points="${X(series[0].t).toFixed(1)},${T+ph} ${pts.join(' ')} ${X(series[series.length-1].t).toFixed(1)},${T+ph}" fill="url(#ca)"/><polyline class="ln" points="${pts.join(' ')}"/>`}
+  $('#chart').innerHTML=s+'</svg>';
+}
+function events(){
+  $('#evs').innerHTML=evs.length?evs.map(e=>`<div class="ev"><span>${fmt(e.rt,1)} s</span><span><span class="tag ${CLS[e.event]||''}">${esc(LBL[e.event]||e.event)}</span></span><span>${esc(e.detail)}</span></div>`).join(''):`<div class="empty"><b>No events yet</b>Link failures, reroutes and recoveries appear here as the controller handles them.</div>`;
+}
+function result(r){
+  const f=k=>Number(r[k]),pf=v=>v==='PASS'?'ok':'bad',pt=v=>v==='PASS'?'Pass':'Fail';
+  const dl=a=>`<dl>${a.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
+  const bt=r.size_bytes===''?'the sum of every packet’s size plus 42 header bytes':`${fmt(f('switch_packets'))} × (${fmt(f('size_bytes'))} + 42)`;
+  $('#res').innerHTML=`<p class="sum">Run ${esc(r.run_id)}: ${esc(r.mode)} mode, ${fmt(f('rate_pps'))} packets/s, ${r.size_bytes===''?'random sizes':fmt(f('size_bytes'))+' bytes'}, ${fmt(f('duration_s'))} s, ${fmt(f('loss_pct'),1)}% link loss${r.fail_at_s===''?'':', link failed at '+fmt(f('fail_at_s'))+' s'}</p>
+  <div class="two"><div class="pn"><h3>Application</h3>${dl([['Packets sent',fmt(f('app_sent'))],['Packets received',fmt(f('app_received'))],['Packet loss',fmt(f('app_loss_pct'),2)+'%'],['Throughput',fmt(f('app_throughput_bps')/1e6,3)+' Mbit/s']])}</div>
+  <div class="pn"><h3>Switch s1</h3>${dl([['Packets counted',fmt(f('switch_packets'))],['Bytes counted',fmt(f('switch_bytes'))],['Outage',r.outage_s===''?'No failure':fmt(f('outage_s'),1)+' s']])}</div></div>
+  <div class="pn"><h3>Do the application and the switch agree?</h3>
+  <div class="ck"><span class="tag ${pf(r.packets_check)}">${pt(r.packets_check)}</span><span>Packets: ${fmt(f('switch_packets'))} at the switch, ${fmt(f('app_sent'))} sent plus 5 end markers</span></div>
+  <div class="ck"><span class="tag ${pf(r.bytes_check)}">${pt(r.bytes_check)}</span><span>Bytes: ${fmt(f('switch_bytes'))} at the switch, expected ${bt}</span></div></div>`;
+}
+let bn=0;
+function bars(title,d,u){
+  const id='b'+(++bn),W=340,H=210,B=32,T=26,mx=Math.max(...[d.static,d.dynamic].filter(v=>v!=null),1)*1.2,ph=H-T-B;
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${title}"><defs><linearGradient id="${id}s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#c77dff"/><stop offset="1" stop-color="#7c3aed"/></linearGradient><linearGradient id="${id}d" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#18c4ff"/><stop offset="1" stop-color="#2f6bff"/></linearGradient></defs>`;
+  [['static',80],['dynamic',200]].forEach(([k,x])=>{const v=d[k];
+    if(v==null)s+=`<text class="ax" x="${x+30}" y="${H-B-8}" text-anchor="middle">No data</text>`;
+    else{const h=Math.max(v/mx*ph,1);s+=`<rect x="${x}" y="${H-B-h}" width="60" height="${h}" fill="url(#${id}${k[0]})"/><text class="vl" x="${x+30}" y="${H-B-h-7}" text-anchor="middle">${fmt(v,1)}${u}</text>`}
+    s+=`<text class="ax" x="${x+30}" y="${H-12}" text-anchor="middle">${k==='static'?'Static':'Dynamic'}</text>`});
+  return`<div class="pn"><h3>${title}</h3><div class="pb">${s}<line class="g" x1="10" x2="${W-10}" y1="${H-B}" y2="${H-B}"/></svg></div></div>`;
+}
+function compare(){
+  const D=rows.filter(r=>r.fail_at_s!==''&&r.fail_at_s!=null);
+  const av=(m,k)=>{const a=D.filter(r=>r.mode===m&&r[k]!==''&&r[k]!=null);return a.length?a.reduce((s,r)=>s+Number(r[k]),0)/a.length:null};
+  const cn=m=>D.filter(r=>r.mode===m).length;
+  $('#csum').textContent=D.length?`Averages over ${cn('static')} static and ${cn('dynamic')} dynamic runs with a link failure.`:'No runs with a link failure yet. Run one with “Fail primary link at” set to compare static and dynamic.';
+  $('#cbars').innerHTML=D.length?bars('Packet loss at the application',{static:av('static','app_loss_pct'),dynamic:av('dynamic','app_loss_pct')},'%')+bars('Outage',{static:av('static','outage_s'),dynamic:av('dynamic','outage_s')},' s'):'';
+  const th=['Run','Group','Mode','Rate','Size','Loss','Sent','Received','Switch packets','Checks','Outage'];
+  $('#tbl').innerHTML=rows.length?`<table><thead><tr>${th.map((h,i)=>`<th class="${i>2?'n':''}">${h}</th>`).join('')}</tr></thead><tbody>${[...rows].reverse().map(r=>`<tr><td>${esc(r.run_id)}</td><td>${esc(r.group)||'–'}</td><td><span class="tag ${r.mode==='static'?'sta':'run'}">${esc(r.mode)}</span></td><td class="n">${fmt(r.rate_pps)}</td><td class="n">${r.size_bytes===''?'random':fmt(r.size_bytes)}</td><td class="n">${fmt(r.loss_pct,1)}%</td><td class="n">${fmt(r.app_sent)}</td><td class="n">${fmt(r.app_received)}</td><td class="n">${fmt(r.switch_packets)}</td><td class="n"><span class="tag ${r.packets_check==='PASS'&&r.bytes_check==='PASS'?'ok':'bad'}">${r.packets_check==='PASS'&&r.bytes_check==='PASS'?'Pass':'Fail'}</span></td><td class="n">${r.outage_s===''?'–':fmt(r.outage_s,1)+' s'}</td></tr>`).join('')}</tbody></table>`:`<div class="empty"><b>No runs yet</b>Completed experiments are listed here.</div>`;
+}
+
+/* ---- start-up ---- */
+document.querySelectorAll('input[name=pattern]').forEach(i=>i.addEventListener('change',()=>{const r=i.value==='random'&&i.checked;if(i.checked){$('#gfix').hidden=r;$('#grnd').hidden=!r}}));
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.v)));
+$('#f').addEventListener('submit',run);
+$('#res').innerHTML=`<div class="pn"><div class="empty"><b>No result yet</b>Run an experiment to see application and switch counts side by side.</div></div>`;
+(async()=>{try{await api('/api/status');setDemo(false)}catch(x){setDemo(true)}await loadRows();draw()})();
+</script>
+</body>
+</html>
