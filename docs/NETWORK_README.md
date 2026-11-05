@@ -1,92 +1,65 @@
-# Network Side (Gyanesh JN, PES1UG25CS189)
+# Network and SDN implementation guide
 
-## What this part does
-It builds a small virtual network and measures the UDP traffic **from inside the switch**, so it can be compared with Harsh's sender/receiver numbers.
+## Topology
 
-- `topology.py` creates h1 (10.0.0.1), h2 (10.0.0.2) and the switch s1.
-- `controller.py` tells the switch how to forward packets, and counts only UDP traffic from h1 to h2 on port 5001.
-- The counts are saved to `results/flow_stats.csv` every 2 seconds.
+`network/topology.py` creates two hosts and three OpenFlow 1.3 switches:
 
-## One-time setup (Ubuntu)
+- h1 (10.0.0.1) connects to s1 port 1.
+- Primary path: s1 port 2 to s3 port 2.
+- Backup path: s1 port 3 to s2 port 1, then s2 port 2 to s3 port 3.
+- h2 (10.0.0.2) connects to s3 port 1.
 
-**1. Install Mininet, Open vSwitch and git**
-```
-sudo apt update
-sudo apt install -y mininet openvswitch-switch git
-```
+The h2-facing link can be configured with packet loss for robustness experiments.
 
-**2. Install Python 3.9** (Ryu does not install cleanly on newer Python versions)
-```
-sudo apt install -y software-properties-common
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install -y python3.9 python3.9-venv python3.9-distutils
-```
-(If `python3.9 --version` already works, skip this step.)
+## Controller
 
-**3. Install Ryu in its own environment**
-```
-python3.9 -m venv ~/ryuenv
-source ~/ryuenv/bin/activate
-pip install setuptools==57.5.0 wheel pbr
-pip install eventlet==0.30.2
-pip install --no-build-isolation git+https://github.com/faucetsdn/ryu.git
-ryu-manager --version
-```
-The last command should print a version number.
+`network/controller.py` installs forwarding rules and polls the UDP measurement flow on s1. It writes current switch counters and controller events to the JSON telemetry file selected by `SDN_LIVE_FILE`.
 
-**Common problems**
-- Do **not** run `pip install --upgrade setuptools`. The newest version breaks the Ryu build ("subprocess-exited-with-error").
-- A red message about `wheel` and `packaging` at the end of the install can be ignored.
-- If `ryu-manager` says `No module named 'oslo'`, run this one line, then try again:
-  `grep -rl "oslo\.config" ~/ryuenv/lib/python3.9/site-packages/ryu ~/ryuenv/bin/ryu-manager | xargs -r sed -i 's/oslo\.config/oslo_config/g'`
-- If Mininet says it cannot import `OVSKSwitch`, the file is out of date. Use the `topology.py` that came with this README (it uses `OVSSwitch`).
-- Use `python3`, not `python`, in all commands.
-- Only the controller terminal needs `source ~/ryuenv/bin/activate`. Run `topology.py` in a normal terminal (no `(ryuenv)` in the prompt).
+The measurement flow is identified by ingress port 1, IPv4, UDP and destination 10.0.0.2. The controller modifies its output action to select the primary or backup path. `OFPFC_MODIFY_STRICT` is used for path changes so the matching flow's counters are preserved.
 
-## How to run
-Keep `controller.py` and `topology.py` in the same folder. Use two terminals.
+### Dynamic behaviour
 
-**Terminal 1: controller**
-```
-source ~/ryuenv/bin/activate
-ryu-manager controller.py
-```
-Leave it running.
+- Default high-rate threshold: 1500 packets/s (`SDN_HIGH_RATE_PPS`).
+- Default low-rate threshold: 1000 packets/s (`SDN_LOW_RATE_PPS`).
+- Above the high threshold, dynamic mode installs output port 3 (backup path).
+- Below the low threshold, dynamic mode restores output port 2 if the primary link is up.
+- A primary-link-down event also redirects to port 3. Recovery is recorded and the primary path is restored when safe.
+- Static mode is the baseline and does not change the path in response to these conditions.
 
-**Terminal 2: network**
-```
+This is path redirection, not rate limiting or packet shaping. The sender continues transmitting at its configured rate.
+
+## Run
+
+Recommended integrated path:
+
+```bash
 sudo mn -c
-sudo python3 topology.py
+sudo python3 web/server.py
 ```
-At the `mininet>` prompt, test with: `h1 ping -c 3 h2` (should show 0% loss).
-Then run Harsh's receiver on h2 and sender on h1.
 
-**To stop:** type `exit` in the network terminal, then press Ctrl+C in the controller terminal.
+Open http://127.0.0.1:8000. The web server starts the Ryu controller for each experiment and launches Mininet with the selected static/dynamic mode.
 
-Rules:
-1. Start the controller **first**, then the network.
-2. Run `sudo mn -c` **before** starting the controller. Running it later stops the controller.
+Command-line alternative:
 
-## The output file: `results/flow_stats.csv`
+```bash
+sudo mn -c
+sudo python3 integration/run_demo.py --mode dynamic --rate 500 --duration 10
+```
 
-| Column | Meaning |
-|---|---|
-| timestamp | Time the reading was taken |
-| flow | Which traffic is counted (h1 to h2, UDP port 5001) |
-| packet_count | Total packets the switch has seen so far |
-| byte_count | Total bytes the switch has seen so far |
-| duration_sec | How long the counting rule has existed |
+The integration script starts its own controller. Do not start a second controller on the same OpenFlow port while running it.
 
-## Things to know for the comparison
-- Counts are **running totals**. For one test, use the last row minus the row before traffic started.
-- The switch counts **42 extra bytes per packet** (network headers). So:
-  switch bytes = application bytes + 42 x number of packets.
-- The file updates every 2 seconds, so wait 2 seconds after the sender finishes before reading the last row.
-- Restart the controller before each new test to start the counts from zero. This also clears the old CSV.
-- Ping and other traffic are **not** counted. Only UDP to port 5001 is.
+## Interpreting counters
 
-## Example (included: `flow_stats_sample.csv`)
-Test: 100 packets, each with 100 bytes of data.
-Result: 100 packets and 14,200 bytes (100 x 142, since 100 data + 42 headers).
-(The sample file shows 101 packets and 14,542 bytes because one earlier 342-byte test packet was also counted.)
+OpenFlow packet/byte counts are cumulative. Compare the final switch counter with its initial value for the same run. Switch bytes include protocol headers, while application bytes count UDP payload only. The sender emits five end markers, which the switch counts but the receiver excludes from data packet totals. Explain these accounting differences in the report.
+
+## Validation checklist
+
+- `h1 ping -c 3 h2` succeeds before traffic testing.
+- The controller connects to all three switches.
+- Normal UDP traffic appears in receiver results and s1 flow statistics.
+- Random packet sizes are reproducible with the same seed.
+- Link failure creates a `link_down` and (dynamic mode) `reroute` event.
+- Link recovery creates a `link_up` and, when safe, a `recover` event.
+- High-rate traffic creates `high_rate_detected` and `high_rate_redirect` events in dynamic mode.
+- Traffic below the low threshold creates `high_rate_cleared` and `high_rate_recovery` events when the primary link is available.
+- Static and dynamic runs are repeated under the same traffic settings before comparing results.

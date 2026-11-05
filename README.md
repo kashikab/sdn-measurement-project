@@ -1,173 +1,180 @@
 # Bandwidth Meter and Traffic Analyzer
 
-**SDN-Socket Programming (Jackfruit) Mini Project | Topic 26 | Protocol: UDP**
-Computer Networks, PES University
+**SDN-Socket Programming Mini Project | Topic 26 | UDP + OpenFlow 1.3**
 
-## Team
+## Project objective
 
-| Member | Name | SRN |
-|---|---|---|
-| Person 1 | Harsh Vardhan Lohia | PES1UG25CS199 |
-| Person 2 | Gyanesh JN | PES1UG25CS189 |
-| Person 3 | Kashika B | PES1UG25CS244 |
+Generate UDP measurement traffic in Mininet, measure it at the sender/receiver and OpenFlow switch, and compare application-level measurements with network-level flow counters. The project also demonstrates dynamic SDN path redirection and recovery.
 
----
+## Features
 
-## 1. Problem Understanding
+- UDP sender with fixed or reproducible random packet sizes, configurable rate, duration and seed.
+- Sequence-numbered and timestamped datagrams; receiver detects missing and duplicate sequence numbers.
+- Application-side packet/byte counts, packet loss and throughput.
+- Three-switch Mininet topology with a primary path (`s1 -> s3`) and backup path (`s1 -> s2 -> s3`).
+- Ryu OpenFlow 1.3 controller and flow-stat polling.
+- Static and dynamic controller modes.
+- Dynamic high-rate response: above 1,500 pps the controller redirects the measured flow to the backup path; below 1,000 pps it can restore the primary path.
+- Link-failure detection, failover and recovery.
+- Browser dashboard for experiment configuration, live telemetry, controller events, results and static/dynamic comparison.
+- CSV experiment history and JSON run artifacts.
 
-### 1.1 Problem Statement
+## Architecture
 
-The assigned problem is to develop a UDP-based traffic measurement application and compare its application-level bandwidth measurements with SDN flow statistics.
-
-In simple terms, the same stream of traffic can be measured from two different places:
-
-- **By the application (host side):** the sender counts what it transmits and the receiver counts what it receives.
-- **By the network (switch side):** the SDN switch keeps its own counters for the traffic passing through it, and the SDN controller can read them.
-
-This project generates UDP traffic, measures it both ways, and compares the two sets of results.
-
-### 1.2 Objectives
-
-1. Generate UDP measurement traffic.
-2. Count transmitted packets.
-3. Count received packets.
-4. Calculate throughput.
-5. Collect SDN flow statistics.
-6. Measure packet loss.
-7. Compare application and network measurements.
-
----
-
-## 2. System Architecture
-
-### 2.1 Components
-
-| Component | Role |
-|---|---|
-| **UDP Sender (h1)** | Generates numbered UDP packets at a configured rate and size, and counts transmitted packets and bytes. |
-| **UDP Receiver (h2)** | Receives packets, counts them, uses sequence numbers to detect losses, and computes throughput and packet loss. |
-| **OpenFlow Switch (s1)** | Forwards traffic between hosts following the controller's flow rules, and keeps packet and byte counters per flow rule. |
-| **SDN Controller (c0)** | Ryu-based controller that installs flow rules on the switch, recognises the UDP measurement flow, and periodically requests flow statistics. |
-| **Results files** | The receiver writes the application results (`/tmp/app_results.json`) and the controller writes the flow statistics (`network/results/flow_stats.csv`). In Deliverable 1 these are checked against each other by hand (test A6); an automated comparison module is planned for Deliverable 2. |
-| **Mininet Topology** | Creates the hosts, switch and links, and connects the switch to the controller. |
-
-### 2.2 Topology
-
-```
-                  +----------------------+
-                  |  SDN Controller (c0) |
-                  +----------------------+
-                     |                ^
-              flow rules        flow statistics
-                     v                |
- +--------------+   UDP    +------------------+   UDP    +--------------+
- |  h1          | -------> |  s1              | -------> |  h2          |
- |  10.0.0.1    | packets  |  OpenFlow switch | packets  |  10.0.0.2    |
- |  UDP Sender  |          |  flow counters   |          |  UDP Receiver|
- +--------------+          +------------------+          +--------------+
+```text
+                   Ryu SDN Controller
+                 (OpenFlow 1.3, port 6633)
+                          |
+                    flow rules/stats
+                          |
+ h1 UDP sender -- s1 -----+----- s3 -- h2 UDP receiver
+                 |              ^
+                 |              |
+                 +---- s2 ------+
+                  backup path
 ```
 
-| Host | IP Address | Role |
-|---|---|---|
-| h1 | 10.0.0.1 | UDP sender |
-| h2 | 10.0.0.2 | UDP receiver |
-
-### 2.3 Communication Flow
-
-1. The Ryu controller starts and listens on port 6653.
-2. Mininet starts, s1 connects to the controller, and the controller installs two rules: a table-miss rule (send unknown traffic to the controller) and a measurement rule (UDP from 10.0.0.1 to 10.0.0.2 on port 5001, forward to h2, with counters).
-3. ARP and ping packets reach the controller through the table-miss rule. It learns MAC addresses and installs forwarding rules so the hosts can reach each other.
-4. The receiver on h2 starts and listens on UDP port 5001.
-5. The sender on h1 transmits numbered packets. They match the measurement rule, so the switch forwards them directly and increments the packet and byte counters. The controller is not involved per packet.
-6. The controller requests flow statistics every 2 seconds and records them in `flow_stats.csv`.
-7. The sender finishes with 5 end-marker packets. Both applications print their totals.
-8. The application results and the switch counters are compared (manually in Deliverable 1, automatically in Deliverable 2).
-
-### 2.4 Packet Format
-
-| Field | Description |
+| Component | Responsibility |
 |---|---|
-| Sequence number (4 bytes) | Lets the receiver detect lost packets. |
-| Padding | Fills the packet to the configured size. |
-| End marker | A final packet carrying the total number sent, so the receiver knows the expected total. It is sent 5 times in case UDP loses it. |
+| `app/sender.py` | Generates UDP packets with sequence number and timestamp; supports fixed/random sizes and pacing. |
+| `app/receiver.py` | Counts unique packets and bytes, detects missing sequence numbers using the end marker, and calculates throughput. |
+| `network/topology.py` | Creates h1, h2 and the three-switch primary/backup topology. |
+| `network/controller.py` | Installs OpenFlow rules, polls flow counters, detects high-rate traffic and link state, and redirects/restores the measured flow. |
+| `web/server.py` | Starts Mininet experiments, manages the controller process, serves the dashboard API and records experiment history. |
+| `web/index.html` | Experiment configuration, live network view, telemetry, events, results and comparisons. |
+| `integration/run_demo.py` | Command-line end-to-end Mininet experiment runner. |
 
-### 2.5 Metrics Measured
+## Setup
 
-| Metric | Application Side | Network Side |
-|---|---|---|
-| Packets | Counted by sender and receiver | Switch flow-rule packet counter |
-| Bytes | Payload bytes counted by the application | Switch byte counter, which includes Ethernet, IP and UDP headers |
-| Throughput | Received bytes divided by time between first and last packet | Switch bytes divided by the measurement interval |
-| Packet loss | Packets sent minus packets received | Switch packet count minus 5 end markers, compared with the receiver's received count. This shows packets lost after the switch. |
+The integrated network requires a Linux environment with Mininet, Open vSwitch, Ryu and Python 3. The dashboard does not replace those dependencies; it orchestrates them.
 
----
+Install system packages (Ubuntu):
 
-### 2.6 Architecture Diagram
-
-![Architecture](docs/topology.png)
-
-```mermaid
-flowchart LR
-    S["h1 UDP Sender<br/>10.0.0.1"] -->|"UDP packets, port 5001"| SW["s1 OpenFlow switch<br/>measurement rule + counters"]
-    SW -->|"forwarded packets"| R["h2 UDP Receiver<br/>10.0.0.2"]
-    C["Ryu controller c0"] -->|"flow rules"| SW
-    SW -.->|"flow statistics every 2 s"| C
-    R --> A["app_results.json<br/>packets, bytes, loss, throughput"]
-    C --> F["flow_stats.csv<br/>packets, bytes"]
-    A --> CMP["Comparison"]
-    F --> CMP
+```bash
+sudo apt update
+sudo apt install -y mininet openvswitch-switch python3 python3-pip
 ```
 
-## 3. Expected Network Behaviour
+Install Ryu in a compatible Python environment. Ryu/eventlet compatibility varies by Python version, so use the working environment validated in your lab rather than upgrading dependencies during the demo. Verify:
 
-- Hosts can reach each other through the switch once the controller has installed forwarding rules.
-- ARP and ping packets are handled by the controller, which learns MAC addresses and installs forwarding rules. The UDP measurement flow matches the pre-installed measurement rule from its very first datagram, so the switch forwards and counts it directly.
-- The packet count seen by the switch should equal the application's packet count plus 5, because the sender transmits 5 copies of the end marker that the application does not count as data (for example 1000 data packets give 1005 on the switch).
-- **The network byte count will be larger than the application byte count.** Each packet carries about 42 bytes of headers (14 Ethernet, 20 IP, 8 UDP) that the application does not count. Throughput figures will also differ slightly, because the headers add bytes and the two measurement time windows differ.
-- Under normal conditions in this setup, little or no packet loss is expected. Loss detection is verified with a deliberate test setting that drops a fraction of packets at the receiver.
+```bash
+ryu-manager --version
+mn --version
+ovs-vsctl --version
+```
 
----
+Install any missing Python dependencies in that same environment. The dashboard uses the Python standard library plus Mininet/Ryu.
 
-## 4. Team Responsibilities
+## Run the dashboard (recommended demo)
 
-| Member | Responsibility |
-|---|---|
-| Harsh Vardhan Lohia (PES1UG25CS199) | UDP sender and receiver; application-side measurements. |
-| Gyanesh JN (PES1UG25CS189) | Mininet topology, SDN controller, flow rules and flow statistics. |
-| Kashika B (PES1UG25CS244) | Integration and comparison; architecture document; end-to-end tests and demonstration. |
+From the repository root:
 
-All three members contributed to the design and test cases.
+```bash
+sudo mn -c
+sudo python3 web/server.py
+```
 
+Open **http://127.0.0.1:8000** in a browser on the same machine.
 
----
+1. Choose **Dynamic** or **Static** mode.
+2. Choose fixed or random packet sizes. A seed makes random packet sizes reproducible.
+3. Set packet rate, size/range and duration.
+4. Optionally set packet loss on the receiver-facing link or schedule a primary-link failure.
+5. Run the experiment and inspect the live topology, switch rate and controller events.
+6. Use the Result and Comparison tabs to inspect measurements and compare static/dynamic runs.
 
-## 5. Repository Layout
+The web server must be run with root privileges because it creates Mininet namespaces and switches. Do not expose this development dashboard to an untrusted network; it is intended for a controlled local lab.
 
-| Folder | Contents |
-|---|---|
-| `app/` | `sender.py` and `receiver.py`, the UDP measurement application |
-| `network/` | `topology.py` (Mininet) and `controller.py` (Ryu SDN controller) |
-| `integration/` | `run_demo.py`, runs the application inside the Mininet network |
-| `docs/` | Detailed documentation: [application and test cases](docs/APP_TESTS_AND_README_SECTION.md), [network side](docs/NETWORK_README.md) |
-| `results/` | Screenshots and sample output from the tests |
+## Run a command-line experiment
 
-## 6. How to Run (summary)
+```bash
+sudo mn -c
+sudo python3 integration/run_demo.py --mode dynamic --rate 500 --duration 10 --pattern random --seed 42
+```
 
-1. Start the controller: `cd network && PYTHONPATH=. ryu-manager controller.py`
-2. In another terminal, from the repo root: `sudo mn -c`, then `sudo python3 integration/run_demo.py`
-3. The application results are written to `/tmp/app_results.json` and the switch counters to `network/results/flow_stats.csv`.
+Use `--mode static` for a static-controller baseline. The script starts and stops its own Ryu controller. Results are written under `results/`.
 
-Full setup steps are in [docs/NETWORK_README.md](docs/NETWORK_README.md); application options are in [docs/APP_TESTS_AND_README_SECTION.md](docs/APP_TESTS_AND_README_SECTION.md).
+## Packet format and measurement notes
 
-## 7. Test Results (summary)
+Each data datagram begins with a 12-byte network-order header: unsigned 32-bit sequence number and 64-bit timestamp. The sender sends five end markers; each marker includes the expected data-packet count. The receiver uses unique sequence numbers and the reported expected count to calculate missing packets.
 
-| ID | Test | Result |
+The application counts UDP payload bytes. OpenFlow switch byte counters include link/network/transport headers and therefore should be larger. For this Ethernet/IPv4/UDP Mininet setup, the expected difference is 42 bytes per packet, excluding any additional encapsulation. The five end markers are also counted by the switch but excluded from application data-packet totals. Do not compare raw byte totals without accounting for these differences.
+
+The switch counter is a cumulative flow counter. Compare deltas from the beginning and end of a single run, not arbitrary snapshots. Flow-stat polling is periodic, so the last sample may lag the end of traffic slightly.
+
+## Controller behaviour
+
+- **Static mode:** keeps the measurement flow on the primary path; it records link events but does not dynamically redirect on high-rate conditions or link failure.
+- **Dynamic mode:** redirects the measurement flow to the backup path when the observed rate exceeds `SDN_HIGH_RATE_PPS` (default 1500). It restores the primary path after the rate falls below `SDN_LOW_RATE_PPS` (default 1000), provided the primary link is available.
+- **Link failure:** a primary-link-down event causes dynamic mode to fail over to the backup path; a recovered primary link can be selected again when the high-rate condition clears.
+
+Thresholds can be changed through environment variables before starting the controller/server. Keep the low threshold lower than the high threshold.
+
+### Flow rules and polling
+
+There is no table-miss rule and no packet-in handling: on connect the controller deletes all flows and installs explicit rules, so unmatched packets are dropped (OpenFlow 1.3 default) and data packets are never sent to the controller.
+
+| Switch | Priority | Match -> action |
 |---|---|---|
-| A1 | Normal transfer (loopback) | 1000 sent, 1000 received, 0% loss |
-| A2 | Forced loss (`--drop-every 10`) | 10.00% loss detected |
-| A3 | Invalid arguments | Clear error each time, nothing sent |
-| A4 | Two senders at once | Separate correct results per sender |
-| A5 | Inside Mininet, no controller | 1000/1000, 0% loss |
-| A6 | Inside Mininet with the SDN controller | App 1000/1000; switch counted 1005 packets, 1,047,210 bytes (1000 data + 5 end-marker copies, 1042 bytes each) |
+| s1 | 100 | in_port 1, IPv4 UDP, dst 10.0.0.2 -> port 2 (primary) or port 3 (backup). **Measurement rule.** |
+| s1 | 60 | ARP from port 1 -> ports 2 and 3 |
+| s1 | 50 | in_port 2 -> 1, in_port 3 -> 1 (return traffic) |
+| s1 | 30 | in_port 1 -> 2 (other traffic such as ping) |
+| s2 | 50 | port 1 <-> port 2 (backup path) |
+| s3 | 50 | port 2 -> 1, port 3 -> 1, port 1 -> 2 |
+| s3 | 60 | ARP from port 1 -> ports 2 and 3 |
 
-Details and screenshots: [docs/APP_TESTS_AND_README_SECTION.md](docs/APP_TESTS_AND_README_SECTION.md) and `results/`.
+The controller requests flow statistics for the measurement rule on s1 every **0.5 s** and writes the packet and byte counters to the live telemetry file. Path changes use `OFPFC_MODIFY_STRICT`, so the counters are not reset on reroute.
+
+### Receiver (threaded)
+
+`app/receiver.py` runs one worker thread per sender (`ip:port`), so several senders to one port are counted separately. It stops when every sender seen has sent its end marker (plus a 0.5 s drain) or at the deadline, so a long link outage is not mistaken for the end of the run. Per-sender results are in the `senders` field of the receiver JSON.
+
+## Results and reproducibility
+
+The dashboard appends experiment rows to `results/experiments.csv`. Current-run JSON artifacts include `last_sender.json`, `last_receiver.json`, `live_telemetry.json` and `last_experiment.json`. These are generated measurements; do not present sample/demo-mode data as real Mininet measurements.
+
+Before final submission, run and retain evidence for:
+
+1. Normal fixed-size transfer.
+2. Reproducible random-size transfer (same seed twice).
+3. Configured packet loss and receiver-side loss detection.
+4. Static versus dynamic primary-link failure experiment.
+5. Congestion-triggered path redirection at a rate above the configured threshold, followed by recovery below the lower threshold.
+6. Application-versus-switch packet and byte comparison, explaining end markers and headers.
+
+A successful Python syntax check does not prove Mininet/Ryu runtime correctness. Validate the above on the actual lab machine and keep the resulting logs/screenshots.
+
+## Repository layout
+
+```text
+app/          UDP sender and receiver
+network/      Mininet topology and Ryu controller
+web/          Browser dashboard and local experiment server
+integration/  Command-line Mininet demo runner
+docs/         Architecture, test plan and network guide
+results/      Example screenshots and generated experiment data
+```
+
+## Ubuntu 22.04 quick start (updated)
+
+After creating `.venv` with the project's Python dependencies and installing Mininet/OVS:
+
+```bash
+cd ~/sdn-measurement-project
+./start.sh
+```
+
+If Ryu is installed in a different Python environment from Mininet (for example a Python 3.9 virtual environment for Ryu), start with `RYU_PYTHON=/path/to/that/python ./start.sh`. The dashboard then launches the controller with that interpreter. If `RYU_PYTHON` is not set, the controller uses the same Python as the dashboard.
+
+Open `http://127.0.0.1:8000` inside the VM. The script cleans Mininet and starts the dashboard. Ryu is launched automatically via `run_ryu.py` (Eventlet compatibility wrapper). Do not launch another Ryu process at the same time. See `docs/TIMING_AND_VALIDATION.md` for timing and outage semantics.
+
+
+## Advanced random-rate traffic
+
+The dashboard defaults to **Random rate (300–2000 packets/s)** with reordering disabled. Constant and Burst rate modes are also selectable. See [docs/ADVANCED_TRAFFIC.md](docs/ADVANCED_TRAFFIC.md) for the algorithm, CLI flags, seed reproducibility, and measurement notes.
+
+
+## Optional packet reordering
+
+Enable **Packet reordering** in the Traffic panel (off by default). See `docs/PACKET_REORDERING.md` for methodology and limitations. The results show out-of-order packet count and percentage.

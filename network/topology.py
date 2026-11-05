@@ -1,40 +1,32 @@
-import argparse
-
-from mininet.cli import CLI
+#!/usr/bin/env python3
+from mininet.topo import Topo
+from mininet.node import OVSKernelSwitch
 from mininet.link import TCLink
-from mininet.log import setLogLevel
-from mininet.net import Mininet
-from mininet.node import OVSSwitch, RemoteController
 
+class TriangleSDNTopo(Topo):
+    """
+    Matches index.html SVG topology exactly:
+      - h1 (10.0.0.1) connected to s1 port 1
+      - Primary Path: s1 (port 2) <---> s3 (port 2)
+      - Backup Path:  s1 (port 3) <---> s2 (port 1) AND s2 (port 2) <---> s3 (port 3)
+      - h2 (10.0.0.2) connected to s3 port 1 (with configurable % packet loss)
+    """
+    def build(self, loss_pct=0.0):
+        s1 = self.addSwitch("s1", cls=OVSKernelSwitch, protocols="OpenFlow13")
+        s2 = self.addSwitch("s2", cls=OVSKernelSwitch, protocols="OpenFlow13")
+        s3 = self.addSwitch("s3", cls=OVSKernelSwitch, protocols="OpenFlow13")
 
-def build(ip, port):
-    net = Mininet(controller=None, switch=OVSSwitch, link=TCLink,
-                  autoSetMacs=False, build=False)
+        h1 = self.addHost("h1", ip="10.0.0.1/24", mac="00:00:00:00:00:01")
+        h2 = self.addHost("h2", ip="10.0.0.2/24", mac="00:00:00:00:00:02")
 
-    net.addController('c0', controller=RemoteController, ip=ip, port=port)
-    s1 = net.addSwitch('s1', protocols='OpenFlow13')
+        self.addLink(h1, s1, port1=1, port2=1, cls=TCLink, bw=100)
+        if loss_pct > 0:
+            self.addLink(h2, s3, port1=1, port2=1, cls=TCLink, bw=100, loss=loss_pct)
+        else:
+            self.addLink(h2, s3, port1=1, port2=1, cls=TCLink, bw=100)
 
-    h1 = net.addHost('h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01')
-    h2 = net.addHost('h2', ip='10.0.0.2/24', mac='00:00:00:00:00:02')
-
-    net.addLink(h1, s1)
-    net.addLink(h2, s1)
-
-    net.build()
-    return net
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--ip', default='127.0.0.1', help='controller IP')
-    parser.add_argument('--port', type=int, default=6653,
-                        help='controller OpenFlow port')
-    args = parser.parse_args()
-
-    setLogLevel('info')
-    net = build(args.ip, args.port)
-    net.start()
-    print('\n*** h1 = 10.0.0.1 (sender), h2 = 10.0.0.2 (receiver)')
-    print('*** Try: h1 ping -c 3 h2\n')
-    CLI(net)
-    net.stop()
+        # Primary Path (s1 port 2 <-> s3 port 2)
+        self.addLink(s1, s3, port1=2, port2=2, cls=TCLink, bw=100)
+        # Backup Path via s2 (s1 port 3 <-> s2 port 1, s2 port 2 <-> s3 port 3)
+        self.addLink(s1, s2, port1=3, port2=1, cls=TCLink, bw=100)
+        self.addLink(s2, s3, port1=2, port2=3, cls=TCLink, bw=100)

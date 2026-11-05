@@ -1,188 +1,204 @@
 #!/usr/bin/env python3
-"""UDP receiver for the Bandwidth Meter and Traffic Analyzer (Person 1).
+"""UDP receiver with one worker thread per sender.
 
-Design (concurrency):
-  * The main thread only receives datagrams and timestamps them.
-  * Each distinct sender IP gets its own worker thread (with its own queue)
-    that does the counting, loss detection and end-marker handling.
-  So several senders can be served at the same time without interfering.
+The main thread only receives datagrams and timestamps them. Each distinct
+sender (source IP and source port, i.e. one sender process) gets its own
+worker thread and queue, which does the counting, loss detection and
+end-marker handling for that sender. Several senders can therefore be measured
+at the same time without mixing their sequence numbers.
 
-Packet format (see docs/CONTRACT.md):
-    bytes 0-3   : sequence number (big-endian unsigned int)
-    bytes 4-end : padding
-    End marker  : a packet whose first 4 bytes are 0xFFFFFFFF, followed by
-                  8 bytes (big-endian unsigned long long) = total packets sent.
+The top-level fields of the output JSON are totals over all senders (this is
+what web/server.py reads, so a single-sender run looks exactly as before).
+The per-sender figures are under the "senders" key.
 """
 import argparse
 import json
+import os
 import queue
 import socket
 import struct
-import sys
 import threading
 import time
 
-END_SEQ = 0xFFFFFFFF
-
-
-def parse_args():
-    ap = argparse.ArgumentParser(description="UDP bandwidth receiver")
-    ap.add_argument("--port", type=int, default=5001, help="UDP port to listen on (default 5001)")
-    ap.add_argument("--bind", default="0.0.0.0", help="address to bind (default 0.0.0.0)")
-    ap.add_argument("--timeout", type=float, default=3.0,
-                    help="stop after this many seconds of silence (default 3)")
-    ap.add_argument("--out", default="/tmp/app_results.json", help="results JSON file")
-    ap.add_argument("--drop-every", type=int, default=0,
-                    help="TEST ONLY: ignore every Nth data packet per sender to simulate loss (0 = off)")
-    return ap.parse_args()
+HEADER_FORMAT = "!Id"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+EOF_SEQ = 0xFFFFFFFF
+EOF_GRACE_S = 0.5      # keep draining briefly after a sender's first end marker
+OUTAGE_GAP_S = 0.25    # inter-arrival gap that counts as an outage
 
 
 class SenderWorker(threading.Thread):
-    """Handles all packets from one sender IP."""
+    """Counts the packets of ONE sender."""
 
-    def __init__(self, ip, drop_every):
-        super().__init__(daemon=True, name=f"worker-{ip}")
-        self.ip = ip
-        self.drop_every = drop_every
+    def __init__(self, label):
+        super().__init__(daemon=True)
+        self.label = label
         self.q = queue.Queue()
-        self.received = 0
-        self.bytes = 0
-        self.first_time = None
-        self.last_time = None
-        self.max_seq = -1
-        self.sent_reported = None
-        self.ignored = 0
-        self.seen = 0
-        self.done = False       # set once the end marker has been processed
+        self.rx_packets = 0
+        self.rx_bytes = 0
+        self.seen = set()
+        self.out_of_order = 0
+        self.highest = -1
+        self.expected = None
+        self.malformed = 0
+        self.first_ts = None
+        self.last_ts = None
+        self.outage_s = 0.0
+        self.prev_ts = None
+        self.eof_ts = None          # arrival time of this sender's first end marker
 
     def run(self):
         while True:
             item = self.q.get()
-            if item is None:            # sentinel from main thread: finish
+            if item is None:
                 return
             data, now = item
-            if len(data) < 4:
-                self.ignored += 1
+            if len(data) < HEADER_SIZE:
+                self.malformed += 1
                 continue
-            seq = struct.unpack("!I", data[:4])[0]
-            if seq == END_SEQ:
-                if len(data) >= 12:
-                    if self.sent_reported is None:      # first copy wins
-                        self.sent_reported = struct.unpack("!Q", data[4:12])[0]
-                    self.done = True
-                else:
-                    self.ignored += 1
+            seq, _ = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+            if seq == EOF_SEQ:
+                if len(data) >= HEADER_SIZE + 4:
+                    self.expected = struct.unpack("!I", data[HEADER_SIZE:HEADER_SIZE + 4])[0]
+                if self.eof_ts is None:
+                    self.eof_ts = now
                 continue
-            self.seen += 1
-            if self.drop_every and self.seen % self.drop_every == 0:
-                continue                # simulated loss
-            if self.first_time is None:
-                self.first_time = now
-            self.last_time = now
-            self.received += 1
-            self.bytes += len(data)
-            self.max_seq = max(self.max_seq, seq)
+            if self.first_ts is None:
+                self.first_ts = now
+            if self.prev_ts is not None:
+                gap = now - self.prev_ts
+                if gap > OUTAGE_GAP_S:
+                    self.outage_s += gap
+            self.prev_ts = now
+            self.last_ts = now
+            if seq not in self.seen:
+                self.seen.add(seq)
+                if seq < self.highest:
+                    self.out_of_order += 1
+                self.highest = max(self.highest, seq)
+                self.rx_packets += 1
+                self.rx_bytes += len(data)
 
-    def result(self):
-        # If every end marker was lost, fall back to highest sequence seen + 1.
-        if self.sent_reported is not None:
-            sent, source = self.sent_reported, "end_marker"
-        else:
-            sent, source = self.max_seq + 1, "estimated_from_max_seq"
-        duration = throughput = None
-        if self.first_time is not None and self.last_time > self.first_time:
-            duration = self.last_time - self.first_time
-            throughput = self.bytes * 8 / duration
-        lost = max(0, sent - self.received)
+    def finish(self, m_start, m_end, fallback_duration):
+        """Final per-sender numbers (call after the thread has been joined)."""
+        outage = self.outage_s
+        if m_end is not None:
+            # Count an unresolved trailing interruption up to the end of traffic.
+            if self.last_ts is not None:
+                trailing = max(0.0, m_end - max(self.last_ts, m_start))
+                if trailing > OUTAGE_GAP_S:
+                    outage += trailing
+            else:
+                outage = max(0.0, m_end - m_start)
+        expected = self.expected
+        if expected is None:
+            expected = (max(self.seen) + 1) if self.seen else 0
+        lost = max(0, expected - self.rx_packets)
+        loss_pct = round(100.0 * lost / expected, 2) if expected else 0.0
+        active = max(0.001, (m_end - m_start) if m_end is not None else fallback_duration)
         return {
-            "sender": self.ip,
-            "packets_sent_reported": sent,
-            "sent_source": source,
-            "packets_received": self.received,
-            "bytes_received": self.bytes,
+            "sender": self.label,
+            "app_received": self.rx_packets,
+            "expected_packets": expected,
+            "expected_source": "end_marker" if self.expected is not None else "estimated_from_max_seq",
             "packets_lost": lost,
-            "loss_percent": (100.0 * lost / sent) if sent > 0 else 0.0,
-            "duration_s": duration,
-            "throughput_bps": throughput,
-            "ignored_malformed": self.ignored,
+            "loss_percent": loss_pct,
+            "rx_bytes": self.rx_bytes,
+            "app_throughput_bps": int(self.rx_bytes * 8 / active),
+            "outage_s": round(outage, 2),
+            "out_of_order_packets": self.out_of_order,
+            "reordering_percent": round(100.0 * self.out_of_order / self.rx_packets, 2) if self.rx_packets else 0.0,
+            "malformed_packets": self.malformed,
         }
 
 
 def main():
-    args = parse_args()
-    if not (1 <= args.port <= 65535):
-        sys.exit("error: port must be between 1 and 65535")
-    if args.drop_every < 0:
-        sys.exit("error: --drop-every must be >= 0")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ip", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9999)
+    parser.add_argument("--duration", type=float, default=15.0)
+    parser.add_argument("--out", default="results/last_receiver.json")
+    parser.add_argument("--measurement-start-file", default=None,
+                        help="JSON file containing start_ts and duration_s, written when sender starts")
+    args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((args.bind, args.port))
-    except OSError as e:
-        sys.exit(f"error: cannot bind {args.bind}:{args.port}: {e}")
+    sock.bind((args.ip, args.port))
+    sock.settimeout(0.5)
 
-    print(f"[receiver] listening on {args.bind}:{args.port} "
-          f"(stops after {args.timeout}s of silence)", flush=True)
+    workers = {}                 # "ip:port" -> SenderWorker
+    short = 0                    # datagrams too short to carry a sender header
+    deadline = time.time() + args.duration + 4.0
 
-    workers = {}
-    seen_any = False
-    try:
-        while True:
-            # Before the first packet, wait longer so the sender can start late.
-            sock.settimeout(60.0 if not seen_any else args.timeout)
-            try:
-                data, addr = sock.recvfrom(65535)
-            except socket.timeout:
-                break
-            now = time.time()
-            seen_any = True
-            ip = addr[0]
-            w = workers.get(ip)
-            if w is None:
-                w = SenderWorker(ip, args.drop_every)
-                w.start()
-                workers[ip] = w
-                print(f"[receiver] new sender {ip}", flush=True)
-            w.q.put((data, now))
-            # Stop early once every sender heard from has sent its end marker
-            # (check after giving the workers a moment to drain their queues).
-            if w.done and all(x.done for x in workers.values()):
-                time.sleep(0.2)
-                if all(x.done and x.q.empty() for x in workers.values()):
-                    break
-    except KeyboardInterrupt:
-        print("\n[receiver] interrupted, reporting what was received", flush=True)
-    finally:
-        sock.close()
-        for w in workers.values():
-            w.q.put(None)
-        for w in workers.values():
-            w.join(timeout=5)
+    while time.time() < deadline:
+        # Stop when every sender seen so far has sent its end marker and the grace period is over.
+        if workers and all(w.eof_ts is not None and time.time() >= w.eof_ts + EOF_GRACE_S
+                           for w in workers.values()):
+            break
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            # Do not stop early on silence: a failed link can stay down until the end.
+            continue
+        now = time.time()
+        label = f"{addr[0]}:{addr[1]}"
+        w = workers.get(label)
+        if w is None:
+            w = SenderWorker(label)
+            workers[label] = w
+            w.start()
+        w.q.put((data, now))
 
-    results = {ip: w.result() for ip, w in workers.items()}
+    sock.close()
+    for w in workers.values():
+        w.q.put(None)            # sentinel: process what is queued, then stop
+    for w in workers.values():
+        w.join()
 
-    try:
-        with open(args.out, "w") as f:
-            json.dump(results, f, indent=2)
-    except OSError as e:
-        print(f"[receiver] warning: could not write {args.out}: {e}", file=sys.stderr)
+    m_start = m_end = None
+    if args.measurement_start_file:
+        try:
+            with open(args.measurement_start_file) as f:
+                measurement = json.load(f)
+            m_start = float(measurement["start_ts"])
+            m_end = m_start + float(measurement["duration_s"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
-    print("\n===== Receiver summary =====")
-    if not results:
-        print("No packets received.")
-    for ip, r in results.items():
-        print(f"Sender {ip}")
-        print(f"  Packets sent (reported) : {r['packets_sent_reported']} ({r['sent_source']})")
-        print(f"  Packets received        : {r['packets_received']}")
-        print(f"  Bytes received          : {r['bytes_received']}")
-        print(f"  Packets lost            : {r['packets_lost']} ({r['loss_percent']:.2f}%)")
-        if r["throughput_bps"] is not None:
-            print(f"  Duration                : {r['duration_s']:.3f} s")
-            print(f"  Throughput              : {r['throughput_bps'] / 1e6:.3f} Mbit/s")
-        else:
-            print("  Throughput              : n/a (too few packets)")
-    print(f"Results written to {args.out}")
+    per_sender = {label: w.finish(m_start, m_end, args.duration) for label, w in workers.items()}
+
+    if per_sender:
+        rx_packets = sum(s["app_received"] for s in per_sender.values())
+        expected = sum(s["expected_packets"] for s in per_sender.values())
+        rx_bytes = sum(s["rx_bytes"] for s in per_sender.values())
+        out_of_order = sum(s["out_of_order_packets"] for s in per_sender.values())
+        malformed = sum(s["malformed_packets"] for s in per_sender.values())
+        outage = max(s["outage_s"] for s in per_sender.values())
+    else:
+        rx_packets = expected = rx_bytes = out_of_order = malformed = 0
+        outage = round(max(0.0, m_end - m_start), 2) if m_end is not None else 0.0
+    lost = max(0, expected - rx_packets)
+    active = max(0.001, (m_end - m_start) if m_end is not None else args.duration)
+
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump({
+            "app_received": rx_packets,
+            "expected_packets": expected,
+            "packets_lost": lost,
+            "loss_percent": round(100.0 * lost / expected, 2) if expected else 0.0,
+            "rx_bytes": rx_bytes,
+            "app_throughput_bps": int(rx_bytes * 8 / active),
+            "outage_s": round(outage, 2),
+            "outage_method": "interarrival_gaps_plus_trailing_window" if m_end is not None else "interarrival_gaps_only",
+            "out_of_order_packets": out_of_order,
+            "reordering_percent": round(100.0 * out_of_order / rx_packets, 2) if rx_packets else 0.0,
+            "malformed_packets": malformed,
+            "sender_count": len(per_sender),
+            "senders": per_sender,
+        }, f)
 
 
 if __name__ == "__main__":
